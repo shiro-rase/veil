@@ -1,0 +1,9 @@
+node_id: vps-main
+network_secret: 9f82ab7c31d4e0821b05934f8261ab7289c02183e29a0f91b728192837462819
+control_server: 1.2.3.4:4242
+ingress_bind: 0.0.0.0:80
+routes:
+  - domain: hui.hui.hui
+    proxy_to: 127.0.0.1:3000
+  - domain: vpss2.myhost
+    proxy_to: 127.0.0.1:8080

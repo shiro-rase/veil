@@ -1,0 +1,103 @@
+use std::collections::HashMap;
+use std::net::Ipv4Addr;
+use veil::crypto::{derive_session_keys, CipherSession, Keypair};
+use veil::dns::DnsResolver;
+use veil::ingress::IngressRouter;
+use veil::proto::{Frame, ObfuscatedCodec};
+
+#[test]
+fn test_crypto_handshake_and_encryption() {
+    let alice = Keypair::generate();
+    let bob = Keypair::generate();
+
+    let secret_alice = alice.diffie_hellman(&bob.public);
+    let secret_bob = bob.diffie_hellman(&alice.public);
+    assert_eq!(secret_alice, secret_bob);
+
+    let network_secret = b"my-super-secret-token";
+    let (alice_tx, _alice_rx) = derive_session_keys(&secret_alice, network_secret, true);
+    let (_bob_tx, bob_rx) = derive_session_keys(&secret_bob, network_secret, false);
+
+    let mut session_alice = CipherSession::new(alice_tx);
+    let mut session_bob = CipherSession::new(bob_rx);
+
+    let msg = b"GET / HTTP/1.1\r\nHost: hui.hui.hui\r\n\r\n";
+    let encrypted = session_alice.encrypt(msg).unwrap();
+    let decrypted = session_bob.decrypt(&encrypted).unwrap();
+    assert_eq!(decrypted, msg);
+}
+
+#[test]
+fn test_obfuscated_codec_framing() {
+    let network_secret = b"veil-network-secret-key-12345678";
+    let codec = ObfuscatedCodec::new(network_secret);
+
+    let frame = Frame::StreamOpen {
+        stream_id: 42,
+        domain: "hui.hui.hui".to_string(),
+        target_port: 80,
+    };
+
+    let encoded = codec.encode_frame(&frame).unwrap();
+    assert!(encoded.len() > 20);
+
+    let mut buf = bytes::BytesMut::from(&encoded[..]);
+    let decoded = codec.try_decode_frame(&mut buf).unwrap().unwrap();
+
+    match decoded {
+        Frame::StreamOpen { stream_id, domain, target_port } => {
+            assert_eq!(stream_id, 42);
+            assert_eq!(domain, "hui.hui.hui");
+            assert_eq!(target_port, 80);
+        }
+        _ => panic!("Unexpected frame variant decoded"),
+    }
+}
+
+#[tokio::test]
+async fn test_ingress_router_host_and_wildcard() {
+    let mut map = HashMap::new();
+    map.insert("hui.hui.hui".to_string(), "127.0.0.1:3000".to_string());
+    map.insert("*.myhost".to_string(), "127.0.0.1:8080".to_string());
+    let router = IngressRouter::new(map);
+
+    assert_eq!(
+        router.get_target("hui.hui.hui").await,
+        Some("127.0.0.1:3000".to_string())
+    );
+    assert_eq!(
+        router.get_target("hui.hui.hui:80").await,
+        Some("127.0.0.1:3000".to_string())
+    );
+    assert_eq!(
+        router.get_target("api.myhost").await,
+        Some("127.0.0.1:8080".to_string())
+    );
+    assert_eq!(
+        router.get_target("unknown.domain").await,
+        None
+    );
+}
+
+#[test]
+fn test_http_host_parser() {
+    let raw_http = b"GET /index.html HTTP/1.1\r\nHost: hui.hui.hui:80\r\nUser-Agent: curl/7.68.0\r\n\r\n";
+    let parsed = IngressRouter::parse_http_host(raw_http);
+    assert_eq!(parsed, Some("hui.hui.hui".to_string()));
+}
+
+#[tokio::test]
+async fn test_dns_resolver_local_matching() {
+    let resolver = DnsResolver::new("1.1.1.1:53".parse().unwrap());
+    resolver.set_domain("hui.hui.hui".to_string(), Ipv4Addr::new(10, 42, 0, 5)).await;
+    resolver.set_domain("*.vps".to_string(), Ipv4Addr::new(10, 42, 0, 9)).await;
+
+    let query = [
+        0x12, 0x34, 0x01, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+        0x03, b'h', b'u', b'i', 0x03, b'h', b'u', b'i', 0x03, b'h', b'u', b'i', 0x00,
+        0x00, 0x01, 0x00, 0x01,
+    ];
+
+    let resp = resolver.handle_query(&query).await.unwrap();
+    assert_eq!(&resp[resp.len() - 4..], &[10, 42, 0, 5]);
+}

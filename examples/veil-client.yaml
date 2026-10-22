@@ -1,0 +1,7 @@
+client_id: laptop-dev
+network_secret: 9f82ab7c31d4e0821b05934f8261ab7289c02183e29a0f91b728192837462819
+control_server: 1.2.3.4:4242
+dns_bind: 127.0.0.1:5353
+upstream_dns: 1.1.1.1:53
+local_http_bind: 127.0.0.1:80
+socks5_bind: 127.0.0.1:1080

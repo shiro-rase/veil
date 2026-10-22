@@ -1,0 +1,3 @@
+bind_addr: 0.0.0.0:4242
+network_secret: 9f82ab7c31d4e0821b05934f8261ab7289c02183e29a0f91b728192837462819
+virtual_subnet: 10.42.0.0/24
