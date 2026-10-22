@@ -23,8 +23,6 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     export PATH="$INSTALL_DIR:$PATH"
 fi
 
-echo -e "${BOLD}${CYAN}=== Veil One-Click Installer ===${NC}"
-
 if ! command -v git >/dev/null 2>&1; then
     echo -e "${BLUE}Installing git...${NC}"
     if command -v apt-get >/dev/null 2>&1; then
@@ -166,6 +164,4 @@ EOF
         ;;
 esac
 
-echo ""
-echo -e "${BOLD}${GREEN}=== Installation Complete ===${NC}"
-echo -e "Run ${BOLD}veil --help${NC} for available commands."
+echo -e "Run veil --help for available commands."
