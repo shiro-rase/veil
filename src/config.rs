@@ -40,6 +40,7 @@ pub struct ControlConfig {
     pub network_secret: String,
     #[serde(default = "default_virtual_subnet")]
     pub virtual_subnet: String,
+    pub acls: Option<Vec<crate::acl::AclRule>>,
 }
 
 fn default_ingress_bind() -> String {
@@ -125,6 +126,10 @@ impl ControlConfig {
             bind_addr: "0.0.0.0:4242".to_string(),
             network_secret: "change-this-to-a-secure-secret-token".to_string(),
             virtual_subnet: "10.42.0.0/24".to_string(),
+            acls: Some(vec![crate::acl::AclRule {
+                client: "*".to_string(),
+                allow: vec!["*".to_string()],
+            }]),
         }
     }
 }

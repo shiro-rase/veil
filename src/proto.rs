@@ -44,6 +44,32 @@ pub enum Frame {
         stream_id: u64,
     },
     Heartbeat,
+    TokenEnroll {
+        token: String,
+        device_id: String,
+        public_key: String,
+        role: String,
+    },
+    EnrollResult {
+        status: String,
+        message: String,
+    },
+    P2PCandidates {
+        peer_id: String,
+        candidates: Vec<String>,
+        probe_token: [u8; 16],
+    },
+    DynamicRouteAdd {
+        domain: String,
+        target_port: u16,
+    },
+    DynamicRouteRemove {
+        domain: String,
+    },
+    AclDenied {
+        domain: String,
+        reason: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -26,6 +26,16 @@ impl IngressRouter {
         map.insert(domain.to_lowercase(), target_addr);
     }
 
+    pub async fn remove_route(&self, domain: &str) {
+        let mut map = self.routes.write().await;
+        map.remove(&domain.to_lowercase());
+    }
+
+    pub async fn list_routes(&self) -> Vec<(String, String)> {
+        let map = self.routes.read().await;
+        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+    }
+
     pub async fn get_target(&self, host: &str) -> Option<String> {
         let clean_host = host.split(':').next()?.to_lowercase();
         let map = self.routes.read().await;

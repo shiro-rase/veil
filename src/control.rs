@@ -1,5 +1,7 @@
+use crate::acl::AclEngine;
 use crate::config::ControlConfig;
 use crate::proto::{Frame, ObfuscatedCodec, RouteEntry};
+use crate::token::{DeviceStatus, TokenManager};
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use std::collections::HashMap;
@@ -35,10 +37,13 @@ pub struct ControlServer {
     clients: Arc<RwLock<HashMap<String, ActiveClient>>>,
     ip_counter: Arc<RwLock<u8>>,
     active_streams: Arc<RwLock<HashMap<u64, StreamPair>>>,
+    acl: Arc<AclEngine>,
+    pub token_mgr: Arc<TokenManager>,
 }
 
 impl ControlServer {
     pub fn new(config: ControlConfig) -> Self {
+        let rules = config.acls.clone().unwrap_or_default();
         Self {
             config: Arc::new(config),
             nodes: Arc::new(RwLock::new(HashMap::new())),
@@ -46,6 +51,8 @@ impl ControlServer {
             clients: Arc::new(RwLock::new(HashMap::new())),
             ip_counter: Arc::new(RwLock::new(2)),
             active_streams: Arc::new(RwLock::new(HashMap::new())),
+            acl: Arc::new(AclEngine::new(rules)),
+            token_mgr: Arc::new(TokenManager::new()),
         }
     }
 
@@ -101,18 +108,55 @@ impl ControlServer {
         peer_role: &mut Option<String>,
     ) -> Result<()> {
         match frame {
+            Frame::TokenEnroll {
+                token,
+                device_id,
+                public_key,
+                role: _,
+            } => {
+                match self.token_mgr.enroll_device(&token, device_id.clone(), public_key).await {
+                    Ok(DeviceStatus::Approved) => {
+                        let _ = peer_tx.send(Frame::EnrollResult {
+                            status: "approved".to_string(),
+                            message: "Device approved".to_string(),
+                        });
+                    }
+                    Ok(DeviceStatus::Pending) => {
+                        let _ = peer_tx.send(Frame::EnrollResult {
+                            status: "pending".to_string(),
+                            message: "Device enrolled but pending admin approval".to_string(),
+                        });
+                    }
+                    Ok(DeviceStatus::Revoked) => {
+                        let _ = peer_tx.send(Frame::EnrollResult {
+                            status: "revoked".to_string(),
+                            message: "Device enrollment revoked".to_string(),
+                        });
+                    }
+                    Err(e) => {
+                        let _ = peer_tx.send(Frame::EnrollResult {
+                            status: "error".to_string(),
+                            message: e.to_string(),
+                        });
+                    }
+                }
+            }
+
             Frame::RegisterNode {
                 node_id,
                 secret_token,
                 domains,
                 virtual_ip,
             } => {
-                if secret_token != self.config.network_secret {
+                let valid_secret = secret_token == self.config.network_secret;
+                let approved_token = self.token_mgr.is_approved(&node_id).await;
+
+                if !valid_secret && !approved_token {
                     let _ = peer_tx.send(Frame::RegisterAck {
                         node_id: node_id.clone(),
                         virtual_ip: String::new(),
                         success: false,
-                        message: "Invalid network secret".to_string(),
+                        message: "Unauthorized or unapproved node".to_string(),
                     });
                     return Err(anyhow!("Unauthorized node"));
                 }
@@ -162,7 +206,10 @@ impl ControlServer {
                 client_id,
                 secret_token,
             } => {
-                if secret_token != self.config.network_secret {
+                let valid_secret = secret_token == self.config.network_secret;
+                let approved_token = self.token_mgr.is_approved(&client_id).await;
+
+                if !valid_secret && !approved_token {
                     return Err(anyhow!("Unauthorized client"));
                 }
 
@@ -184,11 +231,65 @@ impl ControlServer {
                 let _ = peer_tx.send(Frame::DomainSync { routes });
             }
 
+            Frame::DynamicRouteAdd { domain, .. } => {
+                if let Some(role) = peer_role.as_deref() {
+                    if let Some(node_id) = role.strip_prefix("node:") {
+                        let mut dmap = self.domain_to_node.write().await;
+                        let mut nmap = self.nodes.write().await;
+
+                        dmap.insert(domain.to_lowercase(), node_id.to_string());
+                        if let Some(node) = nmap.get_mut(node_id) {
+                            if !node.domains.contains(&domain) {
+                                node.domains.push(domain.clone());
+                            }
+                        }
+
+                        println!("Dynamic route registered: {} -> {}", domain, node_id);
+                        drop(dmap);
+                        drop(nmap);
+                        self.broadcast_domains().await;
+                    }
+                }
+            }
+
+            Frame::DynamicRouteRemove { domain } => {
+                if let Some(role) = peer_role.as_deref() {
+                    if let Some(node_id) = role.strip_prefix("node:") {
+                        let mut dmap = self.domain_to_node.write().await;
+                        let mut nmap = self.nodes.write().await;
+
+                        dmap.remove(&domain.to_lowercase());
+                        if let Some(node) = nmap.get_mut(node_id) {
+                            node.domains.retain(|d| d != &domain);
+                        }
+
+                        println!("Dynamic route removed: {}", domain);
+                        drop(dmap);
+                        drop(nmap);
+                        self.broadcast_domains().await;
+                    }
+                }
+            }
+
             Frame::StreamOpen {
                 stream_id,
                 domain,
                 target_port,
             } => {
+                let client_id = peer_role
+                    .as_deref()
+                    .and_then(|r| r.strip_prefix("client:"))
+                    .unwrap_or("unknown");
+
+                if !self.acl.is_allowed(client_id, &domain) {
+                    println!("ACL Denied: client '{}' -> domain '{}'", client_id, domain);
+                    let _ = peer_tx.send(Frame::AclDenied {
+                        domain,
+                        reason: "Access forbidden by Veil ACL policy".to_string(),
+                    });
+                    return Ok(());
+                }
+
                 let target_node_id = {
                     let dmap = self.domain_to_node.read().await;
                     dmap.get(&domain.to_lowercase()).cloned()
@@ -234,6 +335,29 @@ impl ControlServer {
                     } else {
                         let _ = pair.client_tx.send(Frame::StreamClose { stream_id });
                     }
+                }
+            }
+
+            Frame::P2PCandidates {
+                peer_id,
+                candidates,
+                probe_token,
+            } => {
+                let nmap = self.nodes.read().await;
+                let cmap = self.clients.read().await;
+
+                if let Some(target_node) = nmap.get(&peer_id) {
+                    let _ = target_node.sender.send(Frame::P2PCandidates {
+                        peer_id: peer_role.clone().unwrap_or_default(),
+                        candidates,
+                        probe_token,
+                    });
+                } else if let Some(target_client) = cmap.get(&peer_id) {
+                    let _ = target_client.sender.send(Frame::P2PCandidates {
+                        peer_id: peer_role.clone().unwrap_or_default(),
+                        candidates,
+                        probe_token,
+                    });
                 }
             }
 

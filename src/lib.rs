@@ -1,3 +1,4 @@
+pub mod acl;
 pub mod ca;
 pub mod client;
 pub mod config;
@@ -5,8 +6,11 @@ pub mod control;
 pub mod crypto;
 pub mod dns;
 pub mod ingress;
+pub mod ipc;
 pub mod node;
+pub mod p2p;
 pub mod proto;
 pub mod socks5;
 pub mod systemd;
+pub mod token;
 pub mod tun;

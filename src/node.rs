@@ -1,9 +1,11 @@
 use crate::config::NodeConfig;
 use crate::ingress::IngressRouter;
+use crate::ipc::{IpcRequest, IpcServer};
 use crate::proto::{Frame, ObfuscatedCodec};
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -39,8 +41,12 @@ impl NodeAgent {
             }
         });
 
+        let (ipc_tx, mut ipc_rx) = mpsc::unbounded_channel::<IpcRequest>();
+        let ipc_sock_path = PathBuf::from("/tmp/veil-node.sock");
+        let _ = IpcServer::start(ipc_sock_path, self.router.clone(), Some(ipc_tx)).await;
+
         loop {
-            match self.connect_and_serve().await {
+            match self.connect_and_serve(&mut ipc_rx).await {
                 Ok(_) => {
                     println!("Node disconnected cleanly, reconnecting in 2s...");
                 }
@@ -52,7 +58,7 @@ impl NodeAgent {
         }
     }
 
-    async fn connect_and_serve(&self) -> Result<()> {
+    async fn connect_and_serve(&self, ipc_rx: &mut mpsc::UnboundedReceiver<IpcRequest>) -> Result<()> {
         let stream = TcpStream::connect(&self.config.control_server).await?;
         println!("Connected to Veil control plane at {}", self.config.control_server);
 
@@ -94,13 +100,30 @@ impl NodeAgent {
 
         let mut read_buf = BytesMut::with_capacity(65536);
         loop {
-            let n = reader.read_buf(&mut read_buf).await?;
-            if n == 0 {
-                return Err(anyhow!("Control server closed socket"));
-            }
-
-            while let Some(frame) = codec.try_decode_frame(&mut read_buf)? {
-                self.handle_frame(frame, &tx).await?;
+            tokio::select! {
+                res = reader.read_buf(&mut read_buf) => {
+                    let n = res?;
+                    if n == 0 {
+                        return Err(anyhow!("Control server closed socket"));
+                    }
+                    while let Some(frame) = codec.try_decode_frame(&mut read_buf)? {
+                        self.handle_frame(frame, &tx).await?;
+                    }
+                }
+                Some(ipc_cmd) = ipc_rx.recv() => {
+                    match ipc_cmd {
+                        IpcRequest::AddRoute { domain, .. } => {
+                            let _ = tx.send(Frame::DynamicRouteAdd {
+                                domain,
+                                target_port: 80,
+                            });
+                        }
+                        IpcRequest::RemoveRoute { domain } => {
+                            let _ = tx.send(Frame::DynamicRouteRemove { domain });
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }

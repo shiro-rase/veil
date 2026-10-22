@@ -120,10 +120,35 @@ Generate root CA and certificates for your domains:
 ./target/release/veil ca --out certs --domains hui.hui.hui vpss2.myhost
 ```
 
-### 7. Install as Background Service (Systemd)
+### 8. Runtime Route Management (No daemon restart)
 
 ```bash
-sudo ./target/release/veil install -t node -c /etc/veil/veil-node.yaml
+veil route add newapp.hui 127.0.0.1:4000
+veil route ls
+veil route rm newapp.hui
+```
+
+### 9. Join Tokens & Enrollment
+
+Generate an enrollment token on Control Plane:
+```bash
+veil token create --role node --ttl 3600 --auto-approve true
+```
+
+Join on a new VPS with a single command:
+```bash
+veil join <TOKEN> --control <CONTROL_IP>:4242
+```
+
+### 10. Access Control Lists (ACL)
+
+Configure granular access in `veil-control.yaml`:
+```yaml
+acls:
+  - client: "laptop-dev"
+    allow: ["*"]
+  - client: "guest-device"
+    allow: ["public.vps", "*.hui.hui"]
 ```
 
 ## Tests

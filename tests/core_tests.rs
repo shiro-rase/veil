@@ -118,3 +118,48 @@ fn test_ca_generation() {
     assert!(temp_dir.join("hui.hui.hui.key").exists());
     let _ = std::fs::remove_dir_all(temp_dir);
 }
+
+#[test]
+fn test_acl_engine_permissions() {
+    use veil::acl::{AclEngine, AclRule};
+
+    let rules = vec![
+        AclRule {
+            client: "admin-laptop".to_string(),
+            allow: vec!["*".to_string()],
+        },
+        AclRule {
+            client: "guest-user".to_string(),
+            allow: vec!["public.vps".to_string(), "*.hui.hui".to_string()],
+        },
+    ];
+    let acl = AclEngine::new(rules);
+
+    assert!(acl.is_allowed("admin-laptop", "secret.internal"));
+    assert!(acl.is_allowed("guest-user", "public.vps"));
+    assert!(acl.is_allowed("guest-user", "app.hui.hui"));
+    assert!(!acl.is_allowed("guest-user", "secret.internal"));
+    assert!(!acl.is_allowed("unregistered-device", "public.vps"));
+}
+
+#[tokio::test]
+async fn test_token_enrollment_and_approval() {
+    use veil::token::{DeviceStatus, TokenManager};
+
+    let mgr = TokenManager::new();
+    let token = mgr.create_token("node".to_string(), 300, false).await;
+    assert!(token.starts_with("veil-tok-"));
+
+    let status = mgr
+        .enroll_device(&token, "node-vps1".to_string(), "pubkey123".to_string())
+        .await
+        .unwrap();
+    assert_eq!(status, DeviceStatus::Pending);
+    assert!(!mgr.is_approved("node-vps1").await);
+
+    mgr.approve_device("node-vps1").await.unwrap();
+    assert!(mgr.is_approved("node-vps1").await);
+
+    mgr.revoke_device("node-vps1").await.unwrap();
+    assert!(!mgr.is_approved("node-vps1").await);
+}
