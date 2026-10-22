@@ -1,6 +1,6 @@
 # Veil
 
-Stealth overlay network with custom domains, port-less L7 ingress, and anti-DPI obfuscated protocol in Rust.
+Stealth overlay network with custom domains, port-less L7 ingress, anti-DPI obfuscated protocol, SOCKS5 proxy, and internal TLS CA in Rust.
 
 ## Features
 
@@ -9,6 +9,9 @@ Stealth overlay network with custom domains, port-less L7 ingress, and anti-DPI 
 - **Zero Inbound Ports on Nodes**: VPS connects outbound to the network. Keep your firewall locked (`ufw default deny incoming`), no public ports required.
 - **Reinforced Obfuscated Protocol**: Anti-DPI frame masking with blake3 Pre-Shared Key entropy and variable random padding, eliminating standard WireGuard fixed packet length signatures.
 - **Embedded DNS**: Internal DNS server answering local domain queries and delegating external domains to upstream resolvers.
+- **RFC 1928 SOCKS5 Proxy**: Seamless routing for any tool (SSH, browsers, databases) to internal Veil domains and IPs.
+- **Internal TLS CA**: Built-in Certificate Authority generator for issuing trusted HTTPS certificates for internal domains without browser warnings.
+- **Systemd Integration**: Single-command daemon installation (`veil install`).
 
 ## Building
 
@@ -78,6 +81,7 @@ control_server: <CONTROL_IP>:4242
 dns_bind: 127.0.0.1:5353
 upstream_dns: 1.1.1.1:53
 local_http_bind: 127.0.0.1:80
+socks5_bind: 127.0.0.1:1080
 ```
 
 Run on Client:
@@ -85,11 +89,30 @@ Run on Client:
 sudo ./target/release/veil client --config veil-client.yaml
 ```
 
-Now you can query your custom domain directly:
+### 5. Accessing Services
+
+Via HTTP Interceptor:
 ```bash
 curl http://hui.hui.hui
 ```
-The request is routed over the encrypted obfuscated tunnel to `127.0.0.1:3000` on your remote VPS.
+
+Via SOCKS5 Proxy:
+```bash
+curl --socks5-hostname 127.0.0.1:1080 http://hui.hui.hui
+```
+
+### 6. Internal TLS Certificates
+
+Generate root CA and certificates for your domains:
+```bash
+./target/release/veil ca --out certs --domains hui.hui.hui vpss2.myhost
+```
+
+### 7. Install as Background Service (Systemd)
+
+```bash
+sudo ./target/release/veil install -t node -c /etc/veil/veil-node.yaml
+```
 
 ## Tests
 

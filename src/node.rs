@@ -145,6 +145,7 @@ impl NodeAgent {
                                         break;
                                     }
                                 }
+                                let _ = b_write.shutdown().await;
                             });
 
                             let conns_cleanup = conns.clone();

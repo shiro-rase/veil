@@ -2,11 +2,13 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use std::fs;
 use std::path::PathBuf;
+use veil::ca::CertificateAuthority;
 use veil::client::ClientAgent;
 use veil::config::{ClientConfig, ControlConfig, NodeConfig};
 use veil::control::ControlServer;
 use veil::crypto::Keypair;
 use veil::node::NodeAgent;
+use veil::systemd::ServiceInstaller;
 
 #[derive(Parser)]
 #[command(name = "veil")]
@@ -40,6 +42,18 @@ enum Commands {
         role: String,
         #[arg(short, long)]
         out: Option<PathBuf>,
+    },
+    Ca {
+        #[arg(short, long, default_value = "certs")]
+        out: PathBuf,
+        #[arg(short, long)]
+        domains: Vec<String>,
+    },
+    Install {
+        #[arg(short = 't', long, value_parser = ["node", "client", "control"])]
+        role: String,
+        #[arg(short, long)]
+        config: String,
     },
     Genkey,
 }
@@ -93,6 +107,18 @@ async fn main() -> Result<()> {
             let target_path = out.unwrap_or_else(|| PathBuf::from(default_filename));
             fs::write(&target_path, yaml_content)?;
             println!("Configuration created at: {}", target_path.display());
+        }
+
+        Commands::Ca { out, domains } => {
+            if domains.is_empty() {
+                CertificateAuthority::generate_ca(&out)?;
+            } else {
+                CertificateAuthority::generate_domain_cert(&domains, out)?;
+            }
+        }
+
+        Commands::Install { role, config } => {
+            ServiceInstaller::install_systemd(&role, &config)?;
         }
 
         Commands::Genkey => {

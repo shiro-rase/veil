@@ -101,3 +101,20 @@ async fn test_dns_resolver_local_matching() {
     let resp = resolver.handle_query(&query).await.unwrap();
     assert_eq!(&resp[resp.len() - 4..], &[10, 42, 0, 5]);
 }
+
+#[test]
+fn test_ca_generation() {
+    let temp_dir = std::env::temp_dir().join(format!("veil-test-certs-{}", rand::random::<u32>()));
+    veil::ca::CertificateAuthority::generate_ca(&temp_dir).unwrap();
+    assert!(temp_dir.join("veil-ca.crt").exists());
+    assert!(temp_dir.join("veil-ca.key").exists());
+
+    veil::ca::CertificateAuthority::generate_domain_cert(
+        &["hui.hui.hui".to_string(), "vps1.vps".to_string()],
+        &temp_dir,
+    )
+    .unwrap();
+    assert!(temp_dir.join("hui.hui.hui.crt").exists());
+    assert!(temp_dir.join("hui.hui.hui.key").exists());
+    let _ = std::fs::remove_dir_all(temp_dir);
+}

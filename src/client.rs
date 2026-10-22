@@ -49,6 +49,19 @@ impl ClientAgent {
             let _ = client_ref.start_http_interceptor(local_http_addr).await;
         });
 
+        if let Some(socks_addr) = &self.config.socks5_bind {
+            if let Ok(addr) = socks_addr.parse() {
+                let s5 = crate::socks5::Socks5Server::new(
+                    addr,
+                    self.to_control_tx.clone(),
+                    self.active_streams.clone(),
+                );
+                tokio::spawn(async move {
+                    let _ = s5.start().await;
+                });
+            }
+        }
+
         loop {
             match self.connect_control_loop().await {
                 Ok(_) => {
@@ -209,6 +222,7 @@ impl ClientAgent {
                     break;
                 }
             }
+            let _ = s_write.shutdown().await;
         });
 
         let ctrl_tx_cleanup = ctrl_tx.clone();

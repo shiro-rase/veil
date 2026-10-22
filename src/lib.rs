@@ -1,3 +1,4 @@
+pub mod ca;
 pub mod client;
 pub mod config;
 pub mod control;
@@ -6,3 +7,6 @@ pub mod dns;
 pub mod ingress;
 pub mod node;
 pub mod proto;
+pub mod socks5;
+pub mod systemd;
+pub mod tun;

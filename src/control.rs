@@ -22,13 +22,19 @@ struct ActiveClient {
 }
 
 #[derive(Clone)]
+struct StreamPair {
+    client_tx: mpsc::UnboundedSender<Frame>,
+    node_tx: mpsc::UnboundedSender<Frame>,
+}
+
+#[derive(Clone)]
 pub struct ControlServer {
     config: Arc<ControlConfig>,
     nodes: Arc<RwLock<HashMap<String, ActiveNode>>>,
     domain_to_node: Arc<RwLock<HashMap<String, String>>>,
     clients: Arc<RwLock<HashMap<String, ActiveClient>>>,
     ip_counter: Arc<RwLock<u8>>,
-    active_streams: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Frame>>>>,
+    active_streams: Arc<RwLock<HashMap<u64, StreamPair>>>,
 }
 
 impl ControlServer {
@@ -192,7 +198,13 @@ impl ControlServer {
                     let nmap = self.nodes.read().await;
                     if let Some(target_node) = nmap.get(&nid) {
                         let mut streams = self.active_streams.write().await;
-                        streams.insert(stream_id, peer_tx.clone());
+                        streams.insert(
+                            stream_id,
+                            StreamPair {
+                                client_tx: peer_tx.clone(),
+                                node_tx: target_node.sender.clone(),
+                            },
+                        );
 
                         let _ = target_node.sender.send(Frame::StreamOpen {
                             stream_id,
@@ -205,15 +217,23 @@ impl ControlServer {
 
             Frame::StreamData { stream_id, payload } => {
                 let streams = self.active_streams.read().await;
-                if let Some(target) = streams.get(&stream_id) {
-                    let _ = target.send(Frame::StreamData { stream_id, payload });
+                if let Some(pair) = streams.get(&stream_id) {
+                    if peer_tx.same_channel(&pair.client_tx) {
+                        let _ = pair.node_tx.send(Frame::StreamData { stream_id, payload });
+                    } else {
+                        let _ = pair.client_tx.send(Frame::StreamData { stream_id, payload });
+                    }
                 }
             }
 
             Frame::StreamClose { stream_id } => {
                 let mut streams = self.active_streams.write().await;
-                if let Some(target) = streams.remove(&stream_id) {
-                    let _ = target.send(Frame::StreamClose { stream_id });
+                if let Some(pair) = streams.remove(&stream_id) {
+                    if peer_tx.same_channel(&pair.client_tx) {
+                        let _ = pair.node_tx.send(Frame::StreamClose { stream_id });
+                    } else {
+                        let _ = pair.client_tx.send(Frame::StreamClose { stream_id });
+                    }
                 }
             }
 
