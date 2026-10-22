@@ -11,9 +11,21 @@ Stealth overlay network with custom domains, port-less L7 ingress, anti-DPI obfu
 - **Embedded DNS**: Internal DNS server answering local domain queries and delegating external domains to upstream resolvers.
 - **RFC 1928 SOCKS5 Proxy**: Seamless routing for any tool (SSH, browsers, databases) to internal Veil domains and IPs.
 - **Internal TLS CA**: Built-in Certificate Authority generator for issuing trusted HTTPS certificates for internal domains without browser warnings.
-- **Systemd Integration**: Single-command daemon installation (`veil install`).
+## One-Line Install
 
-## Building
+Run on any Linux machine (VPS, Client, or Control):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/shiro-rase/veil/main/install.sh | bash
+```
+
+The interactive script automatically:
+1. Installs dependencies and builds the Veil binary to `/usr/local/bin/veil`
+2. Configures your role (Node, Client, or Control)
+3. Sets up internal domains and target local ports
+4. Installs and starts the background `systemd` service
+
+## Building from Source
 
 ```bash
 cargo build --release
