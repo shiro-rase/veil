@@ -17,6 +17,9 @@ pub struct NodeConfig {
     #[serde(default = "default_ingress_bind")]
     pub ingress_bind: String,
     pub routes: Vec<RouteConfig>,
+    pub web_bind: Option<String>,
+    pub web_domain: Option<String>,
+    pub cert_dir: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -94,6 +97,9 @@ impl NodeConfig {
                     proxy_to: "127.0.0.1:8080".to_string(),
                 },
             ],
+            web_bind: Some("0.0.0.0:8443".to_string()),
+            web_domain: None,
+            cert_dir: Some("/etc/veil/certs".to_string()),
         }
     }
 }

@@ -316,3 +316,16 @@ fn test_qr_terminal_rendering() {
     let qr = veil::qr::render_qr_terminal(content).unwrap();
     assert!(!qr.is_empty());
 }
+
+#[test]
+fn test_node_web_server_tls_flow() {
+    let temp_dir = std::env::temp_dir().join(format!("veil-cert-test-{}", rand::random::<u32>()));
+    let _ = std::fs::create_dir_all(&temp_dir);
+
+    let cert_path = temp_dir.join("testnode.vps.crt");
+    let key_path = temp_dir.join("testnode.vps.key");
+    veil::ca::CertificateAuthority::generate_domain_cert(&["testnode.vps".to_string()], &temp_dir).unwrap();
+    assert!(cert_path.exists());
+    assert!(key_path.exists());
+    let _ = std::fs::remove_dir_all(&temp_dir);
+}

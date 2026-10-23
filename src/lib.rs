@@ -13,6 +13,7 @@ pub mod ingress;
 pub mod ipc;
 pub mod kv;
 pub mod node;
+pub mod node_web;
 pub mod p2p;
 pub mod proto;
 pub mod qr;

@@ -1,0 +1,58 @@
+{
+  "name": "veil-design-system",
+  "version": "1.0.0",
+  "color": {
+    "background": {
+      "base": "#0a0e14",
+      "surface": "#111722",
+      "elevated": "#172030",
+      "overlay": "#1c273a"
+    },
+    "border": {
+      "subtle": "#1e293b",
+      "default": "#283548",
+      "active": "#3b82f6",
+      "signal": "#00e676"
+    },
+    "text": {
+      "primary": "#f1f5f9",
+      "secondary": "#94a3b8",
+      "muted": "#64748b",
+      "accent": "#38bdf8"
+    },
+    "status": {
+      "online": "#00e676",
+      "warning": "#f59e0b",
+      "danger": "#ef4444",
+      "offline": "#64748b"
+    }
+  },
+  "typography": {
+    "fontFamily": {
+      "mono": "ui-monospace, 'JetBrains Mono', 'SF Mono', Menlo, Consolas, monospace",
+      "sans": "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif"
+    },
+    "fontSize": {
+      "xs": "11px",
+      "sm": "12px",
+      "base": "14px",
+      "lg": "16px",
+      "xl": "20px",
+      "2xl": "28px"
+    }
+  },
+  "spacing": {
+    "1": "4px",
+    "2": "8px",
+    "3": "12px",
+    "4": "16px",
+    "5": "20px",
+    "6": "24px",
+    "8": "32px"
+  },
+  "radii": {
+    "sm": "4px",
+    "md": "6px",
+    "lg": "8px"
+  }
+}

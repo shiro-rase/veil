@@ -58,6 +58,9 @@ async fn test_end_to_end_veil_tunnel() {
             domain: "hui.hui.hui".to_string(),
             proxy_to: backend_addr.to_string(),
         }],
+        web_bind: None,
+        web_domain: None,
+        cert_dir: None,
     };
     let node = NodeAgent::new(node_cfg);
     tokio::spawn(async move {

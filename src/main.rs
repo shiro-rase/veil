@@ -163,6 +163,14 @@ enum Commands {
         #[arg(short, long)]
         config: Option<PathBuf>,
     },
+    Console {
+        #[arg(short, long)]
+        domain: String,
+        #[arg(short, long, default_value = "0.0.0.0:8443")]
+        bind: String,
+        #[arg(short, long, default_value = "/etc/veil/certs")]
+        certs: PathBuf,
+    },
 }
 
 #[derive(Subcommand)]
@@ -644,6 +652,9 @@ async fn main() -> Result<()> {
                         domain: "hui.hui.hui".to_string(),
                         proxy_to: "127.0.0.1:3000".to_string(),
                     }],
+                    web_bind: None,
+                    web_domain: None,
+                    cert_dir: None,
                 };
                 let cfg_path = PathBuf::from("veil-node.yaml");
                 fs::write(&cfg_path, serde_yaml::to_string(&cfg)?)?;
@@ -823,6 +834,11 @@ async fn main() -> Result<()> {
             stream.write_all(&codec.encode_frame(&reg)?).await?;
             stream.write_all(&codec.encode_frame(&Frame::LockdownNotice { initiator: cfg.client_id })?).await?;
             println!("EMERGENCY LOCKDOWN INITIATED: Mesh signals dispatched");
+        }
+
+        Commands::Console { domain, bind, certs } => {
+            let server = veil::node_web::NodeWebServer::new(domain, bind, certs, vec![]);
+            server.run().await?;
         }
     }
 

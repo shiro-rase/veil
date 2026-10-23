@@ -49,6 +49,27 @@ impl NodeAgent {
             }
         });
 
+        let web_bind = self.config.web_bind.clone().unwrap_or_else(|| "0.0.0.0:8443".to_string());
+        let cert_dir = self.config.cert_dir.clone().unwrap_or_else(|| "/etc/veil/certs".to_string());
+        let primary_domain = self
+            .config
+            .web_domain
+            .clone()
+            .or_else(|| {
+                self.config
+                    .routes
+                    .iter()
+                    .find(|r| r.domain.ends_with(".vps"))
+                    .map(|r| r.domain.clone())
+            })
+            .or_else(|| self.config.routes.first().map(|r| r.domain.clone()))
+            .unwrap_or_else(|| format!("{}.vps", self.config.node_id));
+        let routes_list: Vec<(String, String)> = self.config.routes.iter().map(|r| (r.domain.clone(), r.proxy_to.clone())).collect();
+        tokio::spawn(async move {
+            let server = crate::node_web::NodeWebServer::new(primary_domain, web_bind, cert_dir, routes_list);
+            let _ = server.run().await;
+        });
+
         let (ipc_tx, mut ipc_rx) = mpsc::unbounded_channel::<IpcRequest>();
         let ipc_sock_path = PathBuf::from("/tmp/veil-node.sock");
         let _ = IpcServer::start(ipc_sock_path, self.router.clone(), Some(ipc_tx)).await;

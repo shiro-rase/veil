@@ -23,3 +23,6 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
 x25519-dalek = { version = "3.0.0", features = ["static_secrets"] }
 qrcode = { version = "0.14.1", default-features = false }
+tokio-rustls = "0.26.6"
+rustls-pki-types = "1.15.1"
+rustls-pemfile = "2.2.0"
