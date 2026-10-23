@@ -2,6 +2,7 @@ use crate::config::ClientConfig;
 use crate::dns::DnsResolver;
 use crate::ingress::IngressRouter;
 use crate::proto::{Frame, ObfuscatedCodec};
+use crate::tun::TunDevice;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use std::collections::HashMap;
@@ -20,6 +21,7 @@ pub struct ClientAgent {
     dns: DnsResolver,
     active_streams: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>>,
     to_control_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Frame>>>>,
+    tun_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl ClientAgent {
@@ -31,6 +33,7 @@ impl ClientAgent {
             dns,
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             to_control_tx: Arc::new(RwLock::new(None)),
+            tun_tx: Arc::new(RwLock::new(None)),
         })
     }
 
@@ -81,6 +84,7 @@ impl ClientAgent {
             dns: self.dns.clone(),
             active_streams: self.active_streams.clone(),
             to_control_tx: self.to_control_tx.clone(),
+            tun_tx: self.tun_tx.clone(),
         }
     }
 
@@ -98,14 +102,66 @@ impl ClientAgent {
             client_id: self.config.client_id.clone(),
             secret_token: self.config.network_secret.clone(),
         };
+
         let encoded = codec.encode_frame(&reg)?;
         writer.write_all(&encoded).await?;
+
+        if let Some(ref exit_node) = self.config.exit_node {
+            let _ = tx.send(Frame::SetExitNode {
+                exit_node_id: exit_node.clone(),
+            });
+            println!("Requesting exit node route via: {}", exit_node);
+        }
+
+        if self.config.tun_enabled.unwrap_or(true) {
+            match TunDevice::create("veil0", Ipv4Addr::new(10, 42, 0, 100)) {
+                Ok(mut tun) => {
+                    println!("Virtual interface veil0 active with IP 10.42.0.100");
+                    if self.config.exit_node.is_some() {
+                        let _ = TunDevice::setup_exit_node_routes(&self.config.control_server, "veil0");
+                        println!("Exit node default routing enabled via veil0");
+                    }
+
+                    let (t_in_tx, mut t_in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                    *self.tun_tx.write().await = Some(t_in_tx);
+
+                    let to_ctrl_packet = tx.clone();
+                    tokio::spawn(async move {
+                        let mut buf = [0u8; 4096];
+                        loop {
+                            tokio::select! {
+                                read_res = tun.read_packet(&mut buf) => {
+                                    if let Ok(n) = read_res {
+                                        if n >= 20 {
+                                            let dst = format!("{}.{}.{}.{}", buf[16], buf[17], buf[18], buf[19]);
+                                            let _ = to_ctrl_packet.send(Frame::IpPacket {
+                                                src_ip: "10.42.0.100".to_string(),
+                                                dst_ip: dst,
+                                                payload: buf[..n].to_vec(),
+                                            });
+                                        }
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Some(packet_to_write) = t_in_rx.recv() => {
+                                    let _ = tun.write_packet(&packet_to_write).await;
+                                }
+                            }
+                        }
+                    });
+                }
+                Err(e) => {
+                    eprintln!("TUN device initialization skipped: {}", e);
+                }
+            }
+        }
 
         let codec_tx = codec.clone();
         tokio::spawn(async move {
             while let Some(frame) = rx.recv().await {
-                if let Ok(bytes) = codec_tx.encode_frame(&frame) {
-                    if writer.write_all(&bytes).await.is_err() {
+                if let Ok(encoded) = codec_tx.encode_frame(&frame) {
+                    if writer.write_all(&encoded).await.is_err() {
                         break;
                     }
                 }
@@ -141,9 +197,17 @@ impl ClientAgent {
                 let mut map = HashMap::new();
                 for r in &routes {
                     map.insert(r.domain.clone(), Ipv4Addr::new(127, 0, 0, 1));
-                    println!("Synced Veil domain: {} (mapped to local interceptor)", r.domain);
+                    println!("Synced Veil domain: {} -> {}", r.domain, r.virtual_ip);
                 }
                 self.dns.update_domains(map).await;
+                let _ = TunDevice::sync_hosts(&routes);
+            }
+
+            Frame::IpPacket { payload, .. } => {
+                let lock = self.tun_tx.read().await;
+                if let Some(ref tx) = *lock {
+                    let _ = tx.send(payload);
+                }
             }
 
             Frame::StreamData { stream_id, payload } => {
@@ -155,6 +219,15 @@ impl ClientAgent {
 
             Frame::StreamClose { stream_id } => {
                 self.active_streams.write().await.remove(&stream_id);
+            }
+
+            Frame::PingResponse { from_node, seq, timestamp_ms } => {
+                let now = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let rtt = now.saturating_sub(timestamp_ms);
+                println!("Ping reply from {}: seq={} rtt={}ms", from_node, seq, rtt);
             }
 
             Frame::Heartbeat => {}

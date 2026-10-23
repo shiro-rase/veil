@@ -2,9 +2,13 @@ use crate::config::NodeConfig;
 use crate::ingress::IngressRouter;
 use crate::ipc::{IpcRequest, IpcServer};
 use crate::proto::{Frame, ObfuscatedCodec};
+use crate::tun::TunDevice;
 use anyhow::{anyhow, Result};
 use bytes::BytesMut;
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::Write;
+use std::net::Ipv4Addr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -16,6 +20,8 @@ pub struct NodeAgent {
     config: Arc<NodeConfig>,
     router: IngressRouter,
     active_local_conns: Arc<RwLock<HashMap<u64, mpsc::UnboundedSender<Vec<u8>>>>>,
+    active_transfers: Arc<RwLock<HashMap<String, File>>>,
+    tun_tx: Arc<RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl NodeAgent {
@@ -29,6 +35,8 @@ impl NodeAgent {
             config: Arc::new(config),
             router,
             active_local_conns: Arc::new(RwLock::new(HashMap::new())),
+            active_transfers: Arc::new(RwLock::new(HashMap::new())),
+            tun_tx: Arc::new(RwLock::new(None)),
         }
     }
 
@@ -141,8 +149,100 @@ impl NodeAgent {
                     for r in &self.config.routes {
                         println!(" -> Domain '{}' bound to '{}'", r.domain, r.proxy_to);
                     }
+
+                    if let Ok(ip) = virtual_ip.parse::<Ipv4Addr>() {
+                        match TunDevice::create("veil0", ip) {
+                            Ok(mut tun) => {
+                                println!("Virtual interface veil0 active with IP {}", ip);
+                                let _ = TunDevice::enable_exit_node_forwarding();
+                                let (t_in_tx, mut t_in_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+                                *self.tun_tx.write().await = Some(t_in_tx);
+
+                                let to_ctrl_packet = to_control.clone();
+                                let node_vip = virtual_ip.clone();
+                                tokio::spawn(async move {
+                                    let mut buf = [0u8; 4096];
+                                    loop {
+                                        tokio::select! {
+                                            read_res = tun.read_packet(&mut buf) => {
+                                                if let Ok(n) = read_res {
+                                                    if n >= 20 {
+                                                        let dst = format!("{}.{}.{}.{}", buf[16], buf[17], buf[18], buf[19]);
+                                                        let _ = to_ctrl_packet.send(Frame::IpPacket {
+                                                            src_ip: node_vip.clone(),
+                                                            dst_ip: dst,
+                                                            payload: buf[..n].to_vec(),
+                                                        });
+                                                    }
+                                                } else {
+                                                    break;
+                                                }
+                                            }
+                                            Some(packet_to_write) = t_in_rx.recv() => {
+                                                let _ = tun.write_packet(&packet_to_write).await;
+                                            }
+                                        }
+                                    }
+                                });
+                            }
+                            Err(e) => {
+                                eprintln!("TUN device initialization skipped: {}", e);
+                            }
+                        }
+                    }
                 } else {
                     eprintln!("Registration rejected by control plane: {}", message);
+                }
+            }
+
+            Frame::IpPacket { payload, .. } => {
+                let lock = self.tun_tx.read().await;
+                if let Some(ref tx) = *lock {
+                    let _ = tx.send(payload);
+                }
+            }
+
+            Frame::PingRequest { seq, timestamp_ms, .. } => {
+                let _ = to_control.send(Frame::PingResponse {
+                    from_node: self.config.node_id.clone(),
+                    seq,
+                    timestamp_ms,
+                });
+            }
+
+            Frame::FileTransferInit { transfer_id, filename, target_path, .. } => {
+                let path = if target_path.is_empty() {
+                    PathBuf::from(format!("/tmp/{}", filename))
+                } else {
+                    PathBuf::from(target_path)
+                };
+                if let Some(parent) = path.parent() {
+                    let _ = std::fs::create_dir_all(parent);
+                }
+                if let Ok(file) = File::create(&path) {
+                    self.active_transfers.write().await.insert(transfer_id, file);
+                    println!("Receiving file {} -> {}", filename, path.display());
+                }
+            }
+
+            Frame::FileTransferChunk { transfer_id, data, .. } => {
+                let mut transfers = self.active_transfers.write().await;
+                if let Some(file) = transfers.get_mut(&transfer_id) {
+                    let _ = file.write_all(&data);
+                }
+            }
+
+            Frame::FileTransferDone { transfer_id, .. } => {
+                let mut transfers = self.active_transfers.write().await;
+                if let Some(mut file) = transfers.remove(&transfer_id) {
+                    let _ = file.flush();
+                    println!("File transfer {} complete", transfer_id);
+                    let _ = to_control.send(Frame::FileTransferDone {
+                        transfer_id,
+                        target_node: self.config.node_id.clone(),
+                        success: true,
+                        message: "Success".to_string(),
+                    });
                 }
             }
 

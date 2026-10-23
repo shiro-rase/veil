@@ -39,6 +39,8 @@ pub struct ControlServer {
     active_streams: Arc<RwLock<HashMap<u64, StreamPair>>>,
     acl: Arc<AclEngine>,
     pub token_mgr: Arc<TokenManager>,
+    exit_node: Arc<RwLock<Option<String>>>,
+    active_pings: Arc<RwLock<HashMap<(String, u64), mpsc::UnboundedSender<Frame>>>>,
 }
 
 impl ControlServer {
@@ -53,6 +55,8 @@ impl ControlServer {
             active_streams: Arc::new(RwLock::new(HashMap::new())),
             acl: Arc::new(AclEngine::new(rules)),
             token_mgr: Arc::new(TokenManager::new()),
+            exit_node: Arc::new(RwLock::new(None)),
+            active_pings: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -363,6 +367,145 @@ impl ControlServer {
 
             Frame::Heartbeat => {
                 let _ = peer_tx.send(Frame::Heartbeat);
+            }
+
+            Frame::SetExitNode { exit_node_id } => {
+                let mut en = self.exit_node.write().await;
+                *en = Some(exit_node_id.clone());
+                println!("Veil exit node configured: {}", exit_node_id);
+            }
+
+            Frame::IpPacket { src_ip, dst_ip, payload } => {
+                let nmap = self.nodes.read().await;
+                let mut sent = false;
+                for node in nmap.values() {
+                    if node.virtual_ip == dst_ip {
+                        let _ = node.sender.send(Frame::IpPacket {
+                            src_ip: src_ip.clone(),
+                            dst_ip: dst_ip.clone(),
+                            payload: payload.clone(),
+                        });
+                        sent = true;
+                        break;
+                    }
+                }
+                if !sent {
+                    let cmap = self.clients.read().await;
+                    for client in cmap.values() {
+                        let _ = client.sender.send(Frame::IpPacket {
+                            src_ip: src_ip.clone(),
+                            dst_ip: dst_ip.clone(),
+                            payload: payload.clone(),
+                        });
+                        sent = true;
+                        break;
+                    }
+                }
+                if !sent {
+                    let en = self.exit_node.read().await;
+                    if let Some(target_exit) = en.as_ref() {
+                        if let Some(node) = nmap.get(target_exit) {
+                            let _ = node.sender.send(Frame::IpPacket {
+                                src_ip,
+                                dst_ip,
+                                payload,
+                            });
+                        }
+                    }
+                }
+            }
+
+            Frame::PingRequest { target_node, seq, timestamp_ms } => {
+                let nmap = self.nodes.read().await;
+                if let Some(node) = nmap.get(&target_node) {
+                    self.active_pings.write().await.insert((target_node.clone(), seq), peer_tx.clone());
+                    let _ = node.sender.send(Frame::PingRequest {
+                        target_node: target_node.clone(),
+                        seq,
+                        timestamp_ms,
+                    });
+                } else {
+                    let _ = peer_tx.send(Frame::PingResponse {
+                        from_node: target_node,
+                        seq,
+                        timestamp_ms,
+                    });
+                }
+            }
+
+            Frame::PingResponse { from_node, seq, timestamp_ms } => {
+                let mut pings = self.active_pings.write().await;
+                if let Some(sender) = pings.remove(&(from_node.clone(), seq)) {
+                    let _ = sender.send(Frame::PingResponse {
+                        from_node,
+                        seq,
+                        timestamp_ms,
+                    });
+                }
+            }
+
+            Frame::FileTransferInit { target_node, transfer_id, filename, target_path, total_size } => {
+                let nmap = self.nodes.read().await;
+                if let Some(node) = nmap.get(&target_node) {
+                    let _ = node.sender.send(Frame::FileTransferInit {
+                        transfer_id,
+                        target_node,
+                        filename,
+                        target_path,
+                        total_size,
+                    });
+                }
+            }
+
+            Frame::FileTransferChunk { target_node, transfer_id, offset, data } => {
+                let nmap = self.nodes.read().await;
+                if let Some(node) = nmap.get(&target_node) {
+                    let _ = node.sender.send(Frame::FileTransferChunk {
+                        transfer_id,
+                        target_node,
+                        offset,
+                        data,
+                    });
+                }
+            }
+
+            Frame::FileTransferDone { target_node, transfer_id, success, message } => {
+                let nmap = self.nodes.read().await;
+                if let Some(node) = nmap.get(&target_node) {
+                    let _ = node.sender.send(Frame::FileTransferDone {
+                        transfer_id,
+                        target_node,
+                        success,
+                        message,
+                    });
+                } else {
+                    let cmap = self.clients.read().await;
+                    for client in cmap.values() {
+                        let _ = client.sender.send(Frame::FileTransferDone {
+                            transfer_id: transfer_id.clone(),
+                            target_node: target_node.clone(),
+                            success,
+                            message: message.clone(),
+                        });
+                    }
+                }
+            }
+
+            Frame::NodeStatusQuery => {
+                let nmap = self.nodes.read().await;
+                let mut status_items = Vec::new();
+                for node in nmap.values() {
+                    status_items.push(crate::proto::NodeStatusItem {
+                        node_id: node.node_id.clone(),
+                        virtual_ip: node.virtual_ip.clone(),
+                        domains: node.domains.clone(),
+                        rx_bytes: 0,
+                        tx_bytes: 0,
+                        is_direct: true,
+                        latency_ms: None,
+                    });
+                }
+                let _ = peer_tx.send(Frame::NodeStatusReply { nodes: status_items });
             }
 
             _ => {}

@@ -76,6 +76,8 @@ async fn test_end_to_end_veil_tunnel() {
         upstream_dns: "1.1.1.1:53".to_string(),
         local_http_bind: client_http_addr.to_string(),
         socks5_bind: None,
+        exit_node: None,
+        tun_enabled: Some(false),
     };
     let client = ClientAgent::new(client_cfg).unwrap();
     tokio::spawn(async move {

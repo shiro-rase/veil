@@ -70,6 +70,58 @@ pub enum Frame {
         domain: String,
         reason: String,
     },
+    IpPacket {
+        src_ip: String,
+        dst_ip: String,
+        payload: Vec<u8>,
+    },
+    PingRequest {
+        target_node: String,
+        seq: u64,
+        timestamp_ms: u64,
+    },
+    PingResponse {
+        from_node: String,
+        seq: u64,
+        timestamp_ms: u64,
+    },
+    FileTransferInit {
+        transfer_id: String,
+        target_node: String,
+        filename: String,
+        target_path: String,
+        total_size: u64,
+    },
+    FileTransferChunk {
+        transfer_id: String,
+        target_node: String,
+        offset: u64,
+        data: Vec<u8>,
+    },
+    FileTransferDone {
+        transfer_id: String,
+        target_node: String,
+        success: bool,
+        message: String,
+    },
+    NodeStatusQuery,
+    NodeStatusReply {
+        nodes: Vec<NodeStatusItem>,
+    },
+    SetExitNode {
+        exit_node_id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct NodeStatusItem {
+    pub node_id: String,
+    pub virtual_ip: String,
+    pub domains: Vec<String>,
+    pub rx_bytes: u64,
+    pub tx_bytes: u64,
+    pub is_direct: bool,
+    pub latency_ms: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

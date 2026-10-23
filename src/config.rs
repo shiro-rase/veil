@@ -31,6 +31,8 @@ pub struct ClientConfig {
     #[serde(default = "default_client_http_bind")]
     pub local_http_bind: String,
     pub socks5_bind: Option<String>,
+    pub exit_node: Option<String>,
+    pub tun_enabled: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -110,6 +112,8 @@ impl ClientConfig {
             upstream_dns: "1.1.1.1:53".to_string(),
             local_http_bind: "127.0.0.1:80".to_string(),
             socks5_bind: Some("127.0.0.1:1080".to_string()),
+            exit_node: None,
+            tun_enabled: Some(true),
         }
     }
 }

@@ -163,3 +163,86 @@ async fn test_token_enrollment_and_approval() {
     mgr.revoke_device("node-vps1").await.unwrap();
     assert!(!mgr.is_approved("node-vps1").await);
 }
+
+#[test]
+fn test_ip_packet_and_ping_codec() {
+    let codec = ObfuscatedCodec::new(b"secret-123456");
+    let packet = Frame::IpPacket {
+        src_ip: "10.42.0.100".to_string(),
+        dst_ip: "10.42.0.4".to_string(),
+        payload: vec![1, 2, 3, 4, 5],
+    };
+
+    let enc = codec.encode_frame(&packet).unwrap();
+    let mut buf = bytes::BytesMut::from(&enc[..]);
+    let dec = codec.try_decode_frame(&mut buf).unwrap().unwrap();
+
+    if let Frame::IpPacket { src_ip, dst_ip, payload } = dec {
+        assert_eq!(src_ip, "10.42.0.100");
+        assert_eq!(dst_ip, "10.42.0.4");
+        assert_eq!(payload, vec![1, 2, 3, 4, 5]);
+    } else {
+        panic!("Wrong frame");
+    }
+
+    let ping = Frame::PingRequest {
+        target_node: "node12".to_string(),
+        seq: 1,
+        timestamp_ms: 123456789,
+    };
+    let enc_ping = codec.encode_frame(&ping).unwrap();
+    let mut buf_ping = bytes::BytesMut::from(&enc_ping[..]);
+    let dec_ping = codec.try_decode_frame(&mut buf_ping).unwrap().unwrap();
+    if let Frame::PingRequest { target_node, seq, timestamp_ms } = dec_ping {
+        assert_eq!(target_node, "node12");
+        assert_eq!(seq, 1);
+        assert_eq!(timestamp_ms, 123456789);
+    } else {
+        panic!("Wrong frame");
+    }
+}
+
+#[test]
+fn test_file_transfer_and_status_codec() {
+    use veil::proto::NodeStatusItem;
+
+    let codec = ObfuscatedCodec::new(b"secret-123456");
+    let init = Frame::FileTransferInit {
+        transfer_id: "tx-1".to_string(),
+        target_node: "node12".to_string(),
+        filename: "test.bin".to_string(),
+        target_path: "/tmp/test.bin".to_string(),
+        total_size: 1024,
+    };
+    let enc_init = codec.encode_frame(&init).unwrap();
+    let mut buf_init = bytes::BytesMut::from(&enc_init[..]);
+    let dec_init = codec.try_decode_frame(&mut buf_init).unwrap().unwrap();
+    if let Frame::FileTransferInit { transfer_id, total_size, .. } = dec_init {
+        assert_eq!(transfer_id, "tx-1");
+        assert_eq!(total_size, 1024);
+    } else {
+        panic!("Wrong frame");
+    }
+
+    let status = Frame::NodeStatusReply {
+        nodes: vec![NodeStatusItem {
+            node_id: "arch".to_string(),
+            virtual_ip: "10.42.0.2".to_string(),
+            domains: vec!["arch.mesh".to_string()],
+            rx_bytes: 100,
+            tx_bytes: 200,
+            is_direct: true,
+            latency_ms: Some(15),
+        }],
+    };
+    let enc_status = codec.encode_frame(&status).unwrap();
+    let mut buf_status = bytes::BytesMut::from(&enc_status[..]);
+    let dec_status = codec.try_decode_frame(&mut buf_status).unwrap().unwrap();
+    if let Frame::NodeStatusReply { nodes } = dec_status {
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0].node_id, "arch");
+        assert_eq!(nodes[0].virtual_ip, "10.42.0.2");
+    } else {
+        panic!("Wrong frame");
+    }
+}
