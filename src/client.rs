@@ -264,6 +264,37 @@ impl ClientAgent {
             return Ok(());
         }
 
+        let req_str = String::from_utf8_lossy(&peek_buf[..n]);
+        let first_line = req_str.lines().next().unwrap_or("");
+        let parts: Vec<&str> = first_line.split_whitespace().collect();
+        if parts.len() >= 2 {
+            let path = parts[1];
+            if path == "/proxy.pac" || path == "/veil.pac" {
+                let pac = "function FindProxyForURL(url, host) {\n  if (shExpMatch(host, \"*.vps\") || shExpMatch(host, \"*.mesh\") || host === \"hui.hui.hui\") {\n    return \"SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080\";\n  }\n  return \"DIRECT\";\n}\n";
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    pac.len(),
+                    pac
+                );
+                let mut s = stream;
+                let _ = s.write_all(resp.as_bytes()).await;
+                return Ok(());
+            }
+            if path == "/veil-ca.crt" || path == "/ca.crt" {
+                let ca_path = std::path::Path::new("/home/user/.config/veil/certs/veil-ca.crt");
+                if let Ok(ca_bytes) = std::fs::read(ca_path) {
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\nContent-Disposition: attachment; filename=\"veil-ca.crt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        ca_bytes.len()
+                    );
+                    let mut s = stream;
+                    let _ = s.write_all(resp.as_bytes()).await;
+                    let _ = s.write_all(&ca_bytes).await;
+                    return Ok(());
+                }
+            }
+        }
+
         let host = if let Some(h) = IngressRouter::parse_http_host(&peek_buf[..n]) {
             h
         } else if let Some(sni) = IngressRouter::parse_tls_sni(&peek_buf[..n]) {
@@ -271,6 +302,18 @@ impl ClientAgent {
         } else {
             return Err(anyhow!("No Host or SNI header found"));
         };
+
+        if (host.starts_with("127.0.0.1") || host.starts_with("localhost")) && parts.len() >= 2 && parts[1] == "/" {
+            let page = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Veil Client Proxy</title><style>:root{--bg:#0a0e14;--card:#111722;--accent:#38bdf8;--green:#00e676;--text:#f1f5f9;--sub:#94a3b8;--border:#1e293b;}body{background:var(--bg);color:var(--text);font-family:ui-monospace,monospace;padding:32px;display:flex;justify-content:center;}main{max-width:640px;width:100%;}.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:24px;margin-bottom:16px;}h1{font-size:18px;margin-bottom:12px;color:var(--accent);}p{color:var(--sub);font-size:13px;line-height:1.6;margin-bottom:8px;}a{color:var(--accent);text-decoration:none;}.link-pill{display:inline-block;background:#172030;border:1px solid var(--border);padding:6px 12px;border-radius:4px;margin:4px 4px 4px 0;font-size:12px;}</style></head><body><main><div class=\"card\"><h1>VEIL CLIENT OVERLAY</h1><p>SOCKS5 Proxy: <strong>127.0.0.1:1080</strong></p><p>Automatic PAC Script: <a href=\"/proxy.pac\">http://127.0.0.1:8880/proxy.pac</a></p><p>Root Certificate: <a href=\"/veil-ca.crt\">Download veil-ca.crt</a></p></div><div class=\"card\"><h1>NODE CONSOLES</h1><div><a class=\"link-pill\" href=\"https://arch.vps\">https://arch.vps</a><a class=\"link-pill\" href=\"https://fedora.vps\">https://fedora.vps</a><a class=\"link-pill\" href=\"https://local.vps\">https://local.vps</a></div></div></main></body></html>";
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                page.len(),
+                page
+            );
+            let mut s = stream;
+            let _ = s.write_all(resp.as_bytes()).await;
+            return Ok(());
+        }
 
         let stream_id = STREAM_COUNTER.fetch_add(1, Ordering::SeqCst);
         let ctrl_tx = {
