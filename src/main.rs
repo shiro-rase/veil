@@ -530,7 +530,7 @@ async fn main() -> Result<()> {
 
         Commands::Ca { out, domains, install } => {
             if install {
-                let ca_file = out.join("veil_root_ca.crt");
+                let ca_file = out.join("veil-ca.crt");
                 if !ca_file.exists() {
                     CertificateAuthority::generate_ca(&out)?;
                 }
