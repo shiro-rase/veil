@@ -267,10 +267,16 @@ impl ClientAgent {
         let req_str = String::from_utf8_lossy(&peek_buf[..n]);
         let first_line = req_str.lines().next().unwrap_or("");
         let parts: Vec<&str> = first_line.split_whitespace().collect();
+        let req_host = IngressRouter::parse_http_host(&peek_buf[..n]).unwrap_or_else(|| "127.0.0.1".to_string());
+        let proxy_ip = req_host.split(':').next().unwrap_or("127.0.0.1");
+
         if parts.len() >= 2 {
             let path = parts[1];
             if path == "/proxy.pac" || path == "/veil.pac" {
-                let pac = "function FindProxyForURL(url, host) {\n  if (shExpMatch(host, \"*.vps\") || shExpMatch(host, \"*.mesh\") || host === \"hui.hui.hui\") {\n    return \"SOCKS5 127.0.0.1:1080; SOCKS 127.0.0.1:1080\";\n  }\n  return \"DIRECT\";\n}\n";
+                let pac = format!(
+                    "function FindProxyForURL(url, host) {{\n  if (shExpMatch(host, \"*.vps\") || shExpMatch(host, \"*.mesh\") || host === \"hui.hui.hui\") {{\n    return \"SOCKS5 {0}:1080; SOCKS {0}:1080; DIRECT\";\n  }}\n  return \"DIRECT\";\n}}\n",
+                    proxy_ip
+                );
                 let resp = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/x-ns-proxy-autoconfig\r\nAccess-Control-Allow-Origin: *\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                     pac.len(),
@@ -281,15 +287,17 @@ impl ClientAgent {
                 return Ok(());
             }
             if path == "/veil-ca.crt" || path == "/ca.crt" {
-                let ca_path = std::path::Path::new("/home/user/.config/veil/certs/veil-ca.crt");
-                if let Ok(ca_bytes) = std::fs::read(ca_path) {
+                let ca_bytes = std::fs::read("/home/user/.config/veil/certs/veil-ca.crt")
+                    .or_else(|_| std::fs::read("/etc/veil/certs/veil-ca.crt"))
+                    .or_else(|_| std::fs::read("/tmp/veil-canonical-ca/veil-ca.crt"));
+                if let Ok(bytes) = ca_bytes {
                     let resp = format!(
                         "HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\nContent-Disposition: attachment; filename=\"veil-ca.crt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                        ca_bytes.len()
+                        bytes.len()
                     );
                     let mut s = stream;
                     let _ = s.write_all(resp.as_bytes()).await;
-                    let _ = s.write_all(&ca_bytes).await;
+                    let _ = s.write_all(&bytes).await;
                     return Ok(());
                 }
             }
@@ -303,8 +311,11 @@ impl ClientAgent {
             return Err(anyhow!("No Host or SNI header found"));
         };
 
-        if (host.starts_with("127.0.0.1") || host.starts_with("localhost")) && parts.len() >= 2 && parts[1] == "/" {
-            let page = "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"UTF-8\"><title>Veil Client Proxy</title><style>:root{--bg:#0a0e14;--card:#111722;--accent:#38bdf8;--green:#00e676;--text:#f1f5f9;--sub:#94a3b8;--border:#1e293b;}body{background:var(--bg);color:var(--text);font-family:ui-monospace,monospace;padding:32px;display:flex;justify-content:center;}main{max-width:640px;width:100%;}.card{background:var(--card);border:1px solid var(--border);border-radius:8px;padding:24px;margin-bottom:16px;}h1{font-size:18px;margin-bottom:12px;color:var(--accent);}p{color:var(--sub);font-size:13px;line-height:1.6;margin-bottom:8px;}a{color:var(--accent);text-decoration:none;}.link-pill{display:inline-block;background:#172030;border:1px solid var(--border);padding:6px 12px;border-radius:4px;margin:4px 4px 4px 0;font-size:12px;}</style></head><body><main><div class=\"card\"><h1>VEIL CLIENT OVERLAY</h1><p>SOCKS5 Proxy: <strong>127.0.0.1:1080</strong></p><p>Automatic PAC Script: <a href=\"/proxy.pac\">http://127.0.0.1:8880/proxy.pac</a></p><p>Root Certificate: <a href=\"/veil-ca.crt\">Download veil-ca.crt</a></p></div><div class=\"card\"><h1>NODE CONSOLES</h1><div><a class=\"link-pill\" href=\"https://arch.vps\">https://arch.vps</a><a class=\"link-pill\" href=\"https://fedora.vps\">https://fedora.vps</a><a class=\"link-pill\" href=\"https://local.vps\">https://local.vps</a></div></div></main></body></html>";
+        if (!host.ends_with(".vps") && !host.ends_with(".mesh") && host != "hui.hui.hui") && parts.len() >= 2 && parts[1] == "/" {
+            let page = format!(
+                r#"<!DOCTYPE html><html lang="en"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Veil Mobile Gateway</title><style>@import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@700&family=MedievalSharp&family=UnifrakturCook:wght@700&display=swap');:root{{--bg:#000000;--card:#0a0a0a;--border:#222222;--text:#ffffff;--sub:#888888;--font-gothic:'UnifrakturCook',serif;--font-med:'MedievalSharp',serif;}}*{{box-sizing:border-box;margin:0;padding:0;}}body{{background:var(--bg);color:var(--text);font-family:var(--font-med);padding:24px 16px;line-height:1.5;}}main{{max-width:540px;margin:0 auto;}}.card{{background:var(--card);border:1px solid var(--border);border-radius:4px;padding:20px;margin-bottom:16px;}}h1{{font-family:var(--font-gothic);font-size:26px;color:#ffffff;margin-bottom:8px;}}h2{{font-family:var(--font-med);font-size:14px;color:var(--sub);text-transform:uppercase;letter-spacing:0.08em;margin-bottom:12px;}}p{{color:var(--sub);font-size:13px;line-height:1.6;margin-bottom:12px;}}ol{{margin-left:20px;color:var(--sub);font-size:13px;line-height:1.8;margin-bottom:14px;}}strong{{color:#ffffff;}}code{{background:#141414;border:1px solid #333333;padding:2px 6px;border-radius:3px;font-size:12px;color:#ffffff;word-break:break-all;}}.btn{{display:block;text-align:center;background:#ffffff;color:#000000;text-decoration:none;font-weight:700;font-size:13px;padding:10px 16px;border-radius:3px;margin:12px 0;letter-spacing:0.06em;text-transform:uppercase;}}.link-pill{{display:inline-block;background:#141414;border:1px solid var(--border);color:#ffffff;padding:8px 14px;border-radius:4px;margin:4px 4px 4px 0;font-size:13px;text-decoration:none;}}.link-pill:hover{{border-color:#ffffff;}}</style></head><body><main><div class="card"><h1>VEIL OVERLAY</h1><h2>Mobile Network Access</h2><p>To connect from your phone (iOS / Android), follow 2 steps:</p><ol><li><strong>Install Root Certificate:</strong><br><a href="/veil-ca.crt" class="btn">Download Root CA (veil-ca.crt)</a></li><li><strong>Configure Wi-Fi Proxy:</strong><br>In Wi-Fi settings on your phone, set Proxy to <strong>Auto</strong> with URL:<br><code>http://{0}:8880/proxy.pac</code><br><em>Or Manual SOCKS5:</em> <code>{0}:1080</code></li></ol></div><div class="card"><h2>Mesh Node Dashboards</h2><div><a class="link-pill" href="https://arch.vps">https://arch.vps</a><a class="link-pill" href="https://fedora.vps">https://fedora.vps</a><a class="link-pill" href="https://local.vps">https://local.vps</a></div></div></main></body></html>"#,
+                proxy_ip
+            );
             let resp = format!(
                 "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 page.len(),
