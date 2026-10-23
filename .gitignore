@@ -1,2 +1,4 @@
 /target
 sample-*.yaml
+.agent/
+.agents/

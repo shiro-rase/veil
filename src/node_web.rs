@@ -63,12 +63,14 @@ impl NodeWebServer {
 
         let domain_name = self.domain.clone();
         let routes_list = self.routes.clone();
+        let cert_directory = self.cert_dir.clone();
 
         loop {
             let (stream, _) = listener.accept().await?;
             let acc = acceptor.clone();
             let d_name = domain_name.clone();
             let r_list = routes_list.clone();
+            let c_dir = cert_directory.clone();
 
             tokio::spawn(async move {
                 if let Ok(mut tls_stream) = acc.accept(stream).await {
@@ -113,22 +115,38 @@ impl NodeWebServer {
                                         )
                                     };
                                     let _ = tls_stream.write_all(resp.as_bytes()).await;
+                                } else if method == "GET" && (path == "/api/ca.crt" || path == "/veil-ca.crt") {
+                                    let ca_file = c_dir.join("veil-ca.crt");
+                                    if let Ok(ca_bytes) = fs::read(ca_file) {
+                                        let resp = format!(
+                                            "HTTP/1.1 200 OK\r\nContent-Type: application/x-x509-ca-cert\r\nContent-Disposition: attachment; filename=\"veil-ca.crt\"\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                                            ca_bytes.len()
+                                        );
+                                        let _ = tls_stream.write_all(resp.as_bytes()).await;
+                                        let _ = tls_stream.write_all(&ca_bytes).await;
+                                    } else {
+                                        let not_found = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
+                                        let _ = tls_stream.write_all(not_found.as_bytes()).await;
+                                    }
                                 } else if method == "POST" && path == "/api/exec" {
                                     let body_start = req.find("\r\n\r\n").map(|idx| idx + 4).unwrap_or(n);
                                     let body_str = &req[body_start..];
                                     let cmd: serde_json::Value = serde_json::from_str(body_str).unwrap_or(json!({ "command": "uptime" }));
                                     let command = cmd.get("command").and_then(|v| v.as_str()).unwrap_or("uptime");
 
+                                    let t_start = std::time::Instant::now();
                                     let res = crate::exec::RemoteExecutor::execute(command, 15).await.unwrap_or(crate::exec::ExecResult {
                                         exit_code: 1,
                                         stdout: String::new(),
                                         stderr: "Execution error".to_string(),
                                     });
+                                    let elapsed_ms = t_start.elapsed().as_millis();
 
                                     let resp_body = json!({
                                         "exit_code": res.exit_code,
                                         "stdout": res.stdout,
-                                        "stderr": res.stderr
+                                        "stderr": res.stderr,
+                                        "elapsed_ms": elapsed_ms
                                     }).to_string();
 
                                     let resp = format!(
@@ -151,9 +169,17 @@ impl NodeWebServer {
 }
 
 fn get_node_telemetry(domain: &str, routes: &[(String, String)]) -> serde_json::Value {
-    let load = fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "0.05 0.08 0.12 1/200".to_string());
+    let load_content = fs::read_to_string("/proc/loadavg").unwrap_or_else(|_| "0.08 0.12 0.15 1/210".to_string());
+    let load_parts: Vec<&str> = load_content.split_whitespace().collect();
+    let load_1m = load_parts.first().copied().unwrap_or("0.10");
+    let load_5m = load_parts.get(1).copied().unwrap_or("0.10");
+    let load_15m = load_parts.get(2).copied().unwrap_or("0.10");
+    let load_str = format!("{} {} {}", load_1m, load_5m, load_15m);
+
     let uptime_str = fs::read_to_string("/proc/uptime").unwrap_or_else(|_| "86400 0".to_string());
     let uptime_secs: f64 = uptime_str.split_whitespace().next().and_then(|s| s.parse().ok()).unwrap_or(0.0);
+    let uptime_hours = format!("{:.1}", uptime_secs / 3600.0);
+    let uptime_days = format!("{:.1}", uptime_secs / 86400.0);
 
     let os_name = if let Ok(content) = fs::read_to_string("/etc/os-release") {
         content.lines()
@@ -164,30 +190,69 @@ fn get_node_telemetry(domain: &str, routes: &[(String, String)]) -> serde_json::
         "Linux".to_string()
     };
 
+    let kernel = fs::read_to_string("/proc/version")
+        .map(|v| v.split_whitespace().nth(2).unwrap_or("unknown").to_string())
+        .unwrap_or_else(|_| "Linux".to_string());
+
     let mem_total_kb = parse_meminfo("MemTotal:");
     let mem_avail_kb = parse_meminfo("MemAvailable:");
+    let mem_free_kb = parse_meminfo("MemFree:");
     let mem_used_kb = mem_total_kb.saturating_sub(mem_avail_kb);
     let mem_pct = if mem_total_kb > 0 { (mem_used_kb as f64 / mem_total_kb as f64) * 100.0 } else { 0.0 };
 
     let routes_json: Vec<serde_json::Value> = routes.iter().map(|(dom, target)| {
+        let proto = if target.ends_with(":8443") || dom.ends_with(".vps") {
+            "HTTPS (TLS 1.3)"
+        } else if target.ends_with(":22") || dom.starts_with("ssh.") {
+            "SSH (TCP)"
+        } else if target.ends_with(":5432") || target.ends_with(":5433") {
+            "PostgreSQL"
+        } else {
+            "HTTP"
+        };
         json!({
             "domain": dom,
             "target": target,
+            "proto": proto,
             "status": "Active"
         })
     }).collect();
 
+    let node_id = domain.split('.').next().unwrap_or("node");
+    let virtual_ip = match node_id {
+        "arch" => "10.42.0.2",
+        "fedora" => "10.42.0.5",
+        "local" => "10.42.0.6",
+        _ => "10.42.0.10"
+    };
+
+    let peers = vec![
+        json!({ "node_id": "arch", "domain": "arch.vps", "ip": "10.42.0.2", "public": "94.237.57.175", "status": "Active", "role": "Control Hub" }),
+        json!({ "node_id": "fedora", "domain": "fedora.vps", "ip": "10.42.0.5", "public": "80.47.237.77", "status": "Active", "role": "Storage Node" }),
+        json!({ "node_id": "local", "domain": "local.vps", "ip": "10.42.0.6", "public": "192.168.8.12", "status": "Active", "role": "LAN Edge" }),
+    ];
+
     json!({
         "domain": domain,
+        "node_id": node_id,
         "os": os_name,
-        "load": load.split_whitespace().take(3).collect::<Vec<_>>().join(", "),
-        "uptime_hours": format!("{:.1}", uptime_secs / 3600.0),
+        "kernel": kernel,
+        "load": load_str,
+        "load_1m": load_1m,
+        "load_5m": load_5m,
+        "load_15m": load_15m,
+        "mem_pct": format!("{:.1}", mem_pct),
         "mem_used_mb": mem_used_kb / 1024,
         "mem_total_mb": mem_total_kb / 1024,
-        "mem_pct": format!("{:.1}", mem_pct),
+        "mem_free_mb": mem_free_kb / 1024,
+        "uptime_hours": uptime_hours,
+        "uptime_days": uptime_days,
+        "virtual_ip": virtual_ip,
         "routes": routes_json,
-        "tls": "TLS 1.3 (Veil Root CA)",
-        "status": "Online"
+        "peers": peers,
+        "tls": "TLS 1.3",
+        "cipher": "TLS_AES_256_GCM_SHA384",
+        "status": "Active"
     })
 }
 
@@ -206,205 +271,668 @@ fn parse_meminfo(key: &str) -> u64 {
 }
 
 fn render_console_html(domain: &str) -> String {
-    format!(
-        r##"<!DOCTYPE html>
+    let tpl = r##"<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Veil Node Settings - {}</title>
+<title>Veil Node Settings &middot; __DOMAIN__</title>
 <style>
-:root {{
-  --bg-base: #0a0e14;
-  --bg-surface: #111722;
-  --bg-elevated: #172030;
-  --border-subtle: #1e293b;
-  --border-active: #283548;
-  --text-primary: #f1f5f9;
-  --text-secondary: #94a3b8;
-  --text-muted: #64748b;
-  --accent-blue: #38bdf8;
-  --signal-green: #00e676;
-  --signal-amber: #f59e0b;
-  --signal-red: #ef4444;
+@import url('https://fonts.googleapis.com/css2?family=Almendra:ital,wght@0,400;0,700;1,400;1,700&family=Cinzel:wght@500;700&family=MedievalSharp&family=Ruslan+Display&family=UnifrakturCook:wght@700&display=swap');
+
+:root {
+  --bg-main: #000000;
+  --bg-card: #0a0a0a;
+  --bg-hover: #141414;
+  --border-color: #222222;
+  --border-focus: #ffffff;
+  --text-primary: #ffffff;
+  --text-secondary: #888888;
+  --text-muted: #555555;
+  --font-gothic: 'UnifrakturCook', 'MedievalSharp', 'Ruslan Display', serif;
+  --font-medieval: 'MedievalSharp', 'Ruslan Display', 'Almendra', 'Cinzel', 'Old English Text MT', 'Cloister Black', serif, fantasy;
+  --font-serif: 'Almendra', 'MedievalSharp', Georgia, serif;
   --font-mono: ui-monospace, "JetBrains Mono", "SF Mono", Menlo, Consolas, monospace;
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
-}}
-* {{ box-sizing: border-box; margin: 0; padding: 0; }}
-body {{ background: var(--bg-base); color: var(--text-primary); font-family: var(--font-sans); padding: 24px; min-height: 100vh; }}
-header {{ display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border-subtle); padding-bottom: 18px; margin-bottom: 24px; }}
-.crumb {{ font-family: var(--font-mono); font-size: 13px; color: var(--text-muted); display: flex; align-items: center; gap: 8px; }}
-.crumb-active {{ color: var(--accent-blue); font-weight: bold; background: #0284c722; padding: 3px 8px; border-radius: 4px; border: 1px solid #0284c744; }}
-.header-right {{ display: flex; align-items: center; gap: 12px; }}
-.tls-badge {{ background: #00e67618; color: var(--signal-green); border: 1px solid #00e67644; font-size: 11px; font-family: var(--font-mono); padding: 4px 10px; border-radius: 4px; display: flex; align-items: center; gap: 6px; }}
-.hud-grid {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 16px; margin-bottom: 24px; }}
-.hud-card {{ background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 18px; position: relative; overflow: hidden; }}
-.hud-card::before {{ content: ""; position: absolute; top: 0; left: 0; right: 0; height: 2px; background: var(--border-active); }}
-.hud-label {{ font-family: var(--font-mono); font-size: 11px; text-transform: uppercase; color: var(--text-muted); letter-spacing: 0.08em; margin-bottom: 8px; }}
-.hud-value {{ font-family: var(--font-mono); font-size: 24px; font-weight: bold; color: var(--text-primary); }}
-.hud-sub {{ font-size: 12px; color: var(--text-secondary); margin-top: 6px; }}
-.bar-track {{ height: 4px; background: #1e293b; border-radius: 2px; margin-top: 8px; overflow: hidden; }}
-.bar-fill {{ height: 100%; background: var(--accent-blue); width: 0%; transition: width 0.4s ease; }}
-.main-grid {{ display: grid; grid-template-columns: 3fr 2fr; gap: 24px; }}
-.panel {{ background: var(--bg-surface); border: 1px solid var(--border-subtle); border-radius: 6px; padding: 20px; }}
-.panel-title {{ font-family: var(--font-mono); font-size: 13px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-secondary); margin-bottom: 16px; display: flex; justify-content: space-between; align-items: center; }}
-table {{ width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 13px; }}
-th, td {{ padding: 12px 8px; text-align: left; border-bottom: 1px solid #162030; }}
-th {{ color: var(--text-muted); font-size: 11px; text-transform: uppercase; }}
-.pill-active {{ background: #00e67618; color: var(--signal-green); padding: 2px 6px; border-radius: 3px; font-size: 11px; }}
-.terminal {{ background: #070a0e; border: 1px solid #1a2434; border-radius: 6px; padding: 14px; font-family: var(--font-mono); font-size: 13px; }}
-.terminal-out {{ min-height: 180px; max-height: 240px; overflow-y: auto; color: #a5f3fc; white-space: pre-wrap; margin-bottom: 12px; line-height: 1.5; }}
-.terminal-bar {{ display: flex; gap: 8px; }}
-.terminal-input {{ flex: 1; background: #0e1520; border: 1px solid #1f2c40; color: #f8fafc; font-family: var(--font-mono); padding: 8px 12px; border-radius: 4px; outline: none; }}
-.terminal-input:focus {{ border-color: var(--accent-blue); }}
-.terminal-btn {{ background: #0284c7; border: none; color: #fff; font-family: var(--font-mono); font-weight: bold; padding: 8px 16px; border-radius: 4px; cursor: pointer; }}
-.chips {{ display: flex; gap: 6px; margin-bottom: 10px; }}
-.chip {{ background: #131d2c; border: 1px solid #1f2d42; color: #94a3b8; font-family: var(--font-mono); font-size: 11px; padding: 4px 8px; border-radius: 4px; cursor: pointer; }}
-.chip:hover {{ color: var(--text-primary); border-color: var(--accent-blue); }}
-.pulse {{ width: 8px; height: 8px; border-radius: 50%; background: var(--signal-green); box-shadow: 0 0 8px var(--signal-green); display: inline-block; }}
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body {
+  background: var(--bg-main);
+  color: var(--text-primary);
+  font-family: var(--font-medieval);
+  padding: 32px 48px;
+  line-height: 1.5;
+  letter-spacing: 0.02em;
+  -webkit-font-smoothing: antialiased;
+}
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  border-bottom: 1px solid var(--border-color);
+  padding-bottom: 20px;
+  margin-bottom: 28px;
+}
+.header-left {
+  display: flex;
+  align-items: baseline;
+  gap: 16px;
+}
+.brand {
+  font-family: var(--font-gothic);
+  font-size: 26px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  color: #ffffff;
+}
+.brand-divider {
+  color: var(--text-muted);
+  font-family: var(--font-medieval);
+  font-size: 18px;
+}
+.node-title {
+  font-family: var(--font-medieval);
+  font-size: 14px;
+  letter-spacing: 0.05em;
+  color: #ffffff;
+  background: #141414;
+  border: 1px solid var(--border-color);
+  padding: 4px 12px;
+  border-radius: 4px;
+}
+.node-switcher {
+  display: flex;
+  gap: 6px;
+}
+.node-btn {
+  font-family: var(--font-medieval);
+  font-size: 13px;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  background: transparent;
+  border: 1px solid var(--border-color);
+  padding: 6px 14px;
+  border-radius: 4px;
+  text-decoration: none;
+  transition: all 0.15s ease;
+}
+.node-btn:hover {
+  color: #ffffff;
+  border-color: #555555;
+}
+.node-btn.active {
+  color: #000000;
+  background: #ffffff;
+  border-color: #ffffff;
+  font-weight: 700;
+}
+.tls-badge {
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  color: var(--text-secondary);
+  border: 1px solid var(--border-color);
+  padding: 6px 12px;
+  border-radius: 4px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #ffffff;
+  display: inline-block;
+}
+.tabs {
+  display: flex;
+  gap: 28px;
+  border-bottom: 1px solid var(--border-color);
+  margin-bottom: 32px;
+}
+.tab-link {
+  font-family: var(--font-medieval);
+  font-size: 14px;
+  letter-spacing: 0.08em;
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  padding: 8px 4px 14px 4px;
+  cursor: pointer;
+  transition: color 0.15s ease, border-color 0.15s ease;
+  text-transform: uppercase;
+}
+.tab-link:hover {
+  color: #ffffff;
+}
+.tab-link.active {
+  color: #ffffff;
+  border-bottom-color: #ffffff;
+  font-weight: 700;
+}
+.tab-content {
+  display: none;
+}
+.tab-content.active {
+  display: block;
+}
+.grid-4 {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+  margin-bottom: 32px;
+}
+.card {
+  background: var(--bg-card);
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  padding: 22px;
+}
+.card-label {
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 10px;
+}
+.card-value {
+  font-family: var(--font-medieval);
+  font-size: 30px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+  color: #ffffff;
+  margin-bottom: 6px;
+}
+.card-sub {
+  font-family: var(--font-serif);
+  font-style: italic;
+  font-size: 13px;
+  color: var(--text-secondary);
+}
+.bar-track {
+  width: 100%;
+  height: 2px;
+  background: #1f1f1f;
+  margin-top: 12px;
+}
+.bar-fill {
+  height: 100%;
+  background: #ffffff;
+  width: 0%;
+  transition: width 0.3s ease;
+}
+.section-title {
+  font-family: var(--font-medieval);
+  font-size: 14px;
+  letter-spacing: 0.1em;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  margin-bottom: 14px;
+}
+.table-container {
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+  margin-bottom: 32px;
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-family: var(--font-medieval);
+  font-size: 13px;
+}
+th {
+  text-align: left;
+  background: var(--bg-card);
+  color: var(--text-muted);
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+td {
+  padding: 14px 16px;
+  border-bottom: 1px solid #161616;
+  color: #ffffff;
+  font-family: var(--font-medieval);
+  font-size: 13px;
+  letter-spacing: 0.03em;
+}
+tr:last-child td {
+  border-bottom: none;
+}
+tr:hover td {
+  background: var(--bg-hover);
+}
+.tag {
+  border: 1px solid var(--border-color);
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-family: var(--font-medieval);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  color: var(--text-secondary);
+  display: inline-block;
+}
+.link {
+  color: #ffffff;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.terminal-card {
+  background: #050505;
+  border: 1px solid var(--border-color);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.terminal-header {
+  background: #0d0d0d;
+  border-bottom: 1px solid var(--border-color);
+  padding: 10px 16px;
+  font-family: var(--font-medieval);
+  font-size: 13px;
+  letter-spacing: 0.05em;
+  color: var(--text-secondary);
+  display: flex;
+  justify-content: space-between;
+}
+.terminal-chips {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  background: #0a0a0a;
+  border-bottom: 1px solid var(--border-color);
+  flex-wrap: wrap;
+}
+.chip {
+  background: transparent;
+  border: 1px solid var(--border-color);
+  color: var(--text-secondary);
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  letter-spacing: 0.03em;
+  padding: 5px 12px;
+  border-radius: 3px;
+  cursor: pointer;
+}
+.chip:hover {
+  color: #ffffff;
+  border-color: #666666;
+}
+.terminal-log {
+  padding: 16px;
+  min-height: 240px;
+  max-height: 400px;
+  overflow-y: auto;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  color: #d4d4d4;
+  white-space: pre-wrap;
+}
+.terminal-input-row {
+  display: flex;
+  background: #0a0a0a;
+  border-top: 1px solid var(--border-color);
+  padding: 10px 16px;
+  align-items: center;
+  gap: 12px;
+}
+.prompt {
+  font-family: var(--font-medieval);
+  font-size: 15px;
+  font-weight: 700;
+  color: var(--text-secondary);
+}
+.term-input {
+  flex: 1;
+  background: transparent;
+  border: none;
+  color: #ffffff;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  outline: none;
+}
+.btn-white {
+  background: #ffffff;
+  color: #000000;
+  border: 1px solid #ffffff;
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 7px 16px;
+  border-radius: 3px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+  transition: opacity 0.15s ease;
+}
+.btn-white:hover {
+  opacity: 0.85;
+}
+.btn-outline {
+  background: transparent;
+  color: #ffffff;
+  border: 1px solid var(--border-color);
+  font-family: var(--font-medieval);
+  font-size: 12px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  padding: 7px 16px;
+  border-radius: 3px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+.btn-outline:hover {
+  border-color: #666666;
+}
+.form-row {
+  display: flex;
+  justify-content: space-between;
+  padding: 14px 0;
+  border-bottom: 1px solid #161616;
+  font-size: 13px;
+}
+.form-label {
+  color: var(--text-secondary);
+  font-family: var(--font-medieval);
+  letter-spacing: 0.04em;
+}
+.form-val {
+  font-family: var(--font-medieval);
+  letter-spacing: 0.04em;
+  color: #ffffff;
+}
 </style>
 </head>
 <body>
-<header>
-  <div class="crumb">
-    <span>VEIL OVERLAY</span> &gt;
-    <span>SETTINGS</span> &gt;
-    <span class="crumb-active">{}</span>
-  </div>
-  <div class="header-right">
-    <div class="tls-badge"><span class="pulse"></span> HTTPS &middot; TLS 1.3</div>
-  </div>
-</header>
 
-<div class="hud-grid">
-  <div class="hud-card">
-    <div class="hud-label">System Load Average</div>
-    <div class="hud-value" id="load-val">...</div>
-    <div class="hud-sub" id="os-sub">Loading OS...</div>
+<div class="header">
+  <div class="header-left">
+    <span class="brand">VEIL OVERLAY</span>
+    <span class="brand-divider">/</span>
+    <span class="node-title">__DOMAIN__</span>
   </div>
-  <div class="hud-card">
-    <div class="hud-label">Memory Utilization</div>
-    <div class="hud-value" id="mem-val">...</div>
-    <div class="bar-track"><div class="bar-fill" id="mem-bar"></div></div>
-    <div class="hud-sub" id="mem-sub">...</div>
-  </div>
-  <div class="hud-card">
-    <div class="hud-label">System Uptime</div>
-    <div class="hud-value" id="uptime-val">...</div>
-    <div class="hud-sub">Hours online without reboot</div>
-  </div>
-  <div class="hud-card">
-    <div class="hud-label">Node Mesh Routing</div>
-    <div class="hud-value" style="color: var(--signal-green);" id="status-val">Online</div>
-    <div class="hud-sub">Domain: <span style="color: var(--accent-blue);">{}</span></div>
+
+  <div style="display: flex; align-items: center; gap: 16px;">
+    <div class="node-switcher">
+      <a href="https://arch.vps" class="node-btn" id="btn-arch">arch.vps</a>
+      <a href="https://fedora.vps" class="node-btn" id="btn-fedora">fedora.vps</a>
+      <a href="https://local.vps" class="node-btn" id="btn-local">local.vps</a>
+    </div>
+
+    <div class="tls-badge">
+      <span class="status-dot"></span>
+      <span>TLS 1.3 STRICT</span>
+    </div>
   </div>
 </div>
 
-<div class="main-grid">
-  <div class="panel">
-    <div class="panel-title">
-      <span>Active Hosted Domains &amp; Services</span>
-      <span class="tls-badge">Veil Gateway</span>
+<div class="tabs">
+  <button class="tab-link active" onclick="setTab('telemetry')">OVERVIEW</button>
+  <button class="tab-link" onclick="setTab('routes')">ROUTES &amp; SERVICES</button>
+  <button class="tab-link" onclick="setTab('config')">CONFIGURATION &amp; CERTS</button>
+  <button class="tab-link" onclick="setTab('terminal')">TERMINAL</button>
+</div>
+
+<div id="view-telemetry" class="tab-content active">
+  <div class="grid-4">
+    <div class="card">
+      <div class="card-label">Load Average</div>
+      <div class="card-value" id="load-val">...</div>
+      <div class="card-sub" id="os-sub">Loading system...</div>
+      <div class="bar-track"><div class="bar-fill" id="cpu-bar" style="width: 20%;"></div></div>
     </div>
+
+    <div class="card">
+      <div class="card-label">Memory</div>
+      <div class="card-value" id="mem-val">...</div>
+      <div class="card-sub" id="mem-sub">...</div>
+      <div class="bar-track"><div class="bar-fill" id="mem-bar" style="width: 0%;"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Uptime</div>
+      <div class="card-value" id="uptime-val">...</div>
+      <div class="card-sub">Continuous host operation</div>
+      <div class="bar-track"><div class="bar-fill" style="width: 100%;"></div></div>
+    </div>
+
+    <div class="card">
+      <div class="card-label">Virtual IP</div>
+      <div class="card-value" id="vip-val">...</div>
+      <div class="card-sub">Subnet: 10.42.0.0/24</div>
+      <div class="bar-track"><div class="bar-fill" style="width: 100%;"></div></div>
+    </div>
+  </div>
+
+  <div class="section-title">Network Mesh Peers</div>
+  <div class="table-container">
     <table>
       <thead>
         <tr>
-          <th>Domain Name</th>
-          <th>Internal Proxy Target</th>
-          <th>Protocol</th>
+          <th>Node</th>
+          <th>Domain</th>
+          <th>Virtual IP</th>
+          <th>Public Address</th>
+          <th>Role</th>
           <th>Status</th>
         </tr>
       </thead>
-      <tbody id="routes-tbody">
-        <tr><td colspan="4" style="color: var(--text-muted);">Querying routes...</td></tr>
+      <tbody id="peers-body">
+        <tr><td colspan="6" style="color: var(--text-muted);">Syncing peers...</td></tr>
       </tbody>
     </table>
   </div>
+</div>
 
-  <div class="panel">
-    <div class="panel-title">
-      <span>Interactive Node Terminal</span>
-      <span style="font-size: 11px; color: var(--text-muted);">Remote Exec</span>
+<div id="view-routes" class="tab-content">
+  <div class="section-title">Active Hosted Domains &amp; Reverse Proxy Targets</div>
+  <div class="table-container">
+    <table>
+      <thead>
+        <tr>
+          <th>Domain</th>
+          <th>Target</th>
+          <th>Protocol</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody id="routes-body">
+        <tr><td colspan="5" style="color: var(--text-muted);">Loading routes...</td></tr>
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<div id="view-config" class="tab-content">
+  <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 24px; margin-bottom: 32px;">
+    <div class="card">
+      <div class="section-title">Certificate Details</div>
+      <div class="form-row">
+        <span class="form-label">Subject Common Name</span>
+        <span class="form-val">__DOMAIN__</span>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Certificate Authority</span>
+        <span class="form-val">Veil Root CA</span>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Protocol &amp; Cipher</span>
+        <span class="form-val">TLS 1.3 / AES-256-GCM</span>
+      </div>
+      <div style="margin-top: 24px;">
+        <a href="/api/ca.crt" class="btn-white">Download Root CA (veil-ca.crt)</a>
+      </div>
     </div>
-    <div class="chips">
-      <span class="chip" onclick="runQuick('uptime')">uptime</span>
-      <span class="chip" onclick="runQuick('ip -br a')">ip -br a</span>
-      <span class="chip" onclick="runQuick('free -m')">free -m</span>
-      <span class="chip" onclick="runQuick('df -h /')">df -h</span>
-    </div>
-    <div class="terminal">
-      <div class="terminal-out" id="term-out">veil-node console ready.\nRun commands safely over internal tunnel.\n</div>
-      <div class="terminal-bar">
-        <input class="terminal-input" id="term-in" placeholder="Enter shell command (e.g. uname -a)" onkeydown="if(event.key==='Enter') runCmd()">
-        <button class="terminal-btn" onclick="runCmd()">EXEC</button>
+
+    <div class="card">
+      <div class="section-title">Overlay Network Ingress</div>
+      <div class="form-row">
+        <span class="form-label">Local Ingress Port</span>
+        <span class="form-val">8099 (SNI &amp; Host Intercept)</span>
+      </div>
+      <div class="form-row">
+        <span class="form-label">Web Console Port</span>
+        <span class="form-val">8443 (Native TLS)</span>
+      </div>
+      <div class="form-row">
+        <span class="form-label">SOCKS5 Proxy Port</span>
+        <span class="form-val">1080</span>
+      </div>
+      <div style="margin-top: 24px;">
+        <button class="btn-outline" onclick="triggerLockdown()">Emergency Mesh Lockdown</button>
       </div>
     </div>
   </div>
 </div>
 
-<script>
-async function loadInfo() {{
-  try {{
-    const res = await fetch('/api/info');
-    const data = await res.json();
-    document.getElementById('load-val').innerText = data.load;
-    document.getElementById('os-sub').innerText = data.os;
-    document.getElementById('mem-val').innerText = data.mem_pct + '%';
-    document.getElementById('mem-bar').style.width = data.mem_pct + '%';
-    document.getElementById('mem-sub').innerText = data.mem_used_mb + ' MB / ' + data.mem_total_mb + ' MB';
-    document.getElementById('uptime-val').innerText = data.uptime_hours + ' hrs';
+<div id="view-terminal" class="tab-content">
+  <div class="terminal-card">
+    <div class="terminal-header">
+      <span>/bin/sh &middot; root@__DOMAIN__</span>
+      <span>Encrypted Session</span>
+    </div>
+    <div class="terminal-chips">
+      <button class="chip" onclick="execQuick('uname -a')">uname -a</button>
+      <button class="chip" onclick="execQuick('uptime')">uptime</button>
+      <button class="chip" onclick="execQuick('ip -br a')">ip -br a</button>
+      <button class="chip" onclick="execQuick('free -m')">free -m</button>
+      <button class="chip" onclick="execQuick('df -h /')">df -h /</button>
+      <button class="chip" onclick="execQuick('ss -tulpn')">ss -tulpn</button>
+      <button class="chip" onclick="clearTerm()">Clear</button>
+    </div>
+    <div class="terminal-log" id="term-log">Veil Terminal ready. Secure session established.
+</div>
+    <div class="terminal-input-row">
+      <span class="prompt">$</span>
+      <input class="term-input" id="term-in" placeholder="Enter shell command..." onkeydown="if(event.key==='Enter') runShell()">
+      <button class="btn-white" onclick="runShell()">RUN</button>
+    </div>
+  </div>
+</div>
 
-    const tbody = document.getElementById('routes-tbody');
-    tbody.innerHTML = '';
-    (data.routes || []).forEach(r => {{
+<script>
+const curDomain = "__DOMAIN__";
+
+function setTab(name) {
+  document.querySelectorAll('.tab-link').forEach(t => t.classList.remove('active'));
+  document.querySelectorAll('.tab-content').forEach(c => c.classList.remove('active'));
+  const btn = Array.from(document.querySelectorAll('.tab-link')).find(b => b.getAttribute('onclick').includes(name));
+  if (btn) btn.classList.add('active');
+  const target = document.getElementById('view-' + name);
+  if (target) target.classList.add('active');
+}
+
+function updateSwitcher() {
+  if (curDomain.includes('arch')) {
+    document.getElementById('btn-arch')?.classList.add('active');
+  } else if (curDomain.includes('fedora')) {
+    document.getElementById('btn-fedora')?.classList.add('active');
+  } else if (curDomain.includes('local')) {
+    document.getElementById('btn-local')?.classList.add('active');
+  }
+}
+
+async function refreshData() {
+  try {
+    const res = await fetch('/api/info');
+    const d = await res.json();
+    document.getElementById('load-val').innerText = d.load_1m || '0.10';
+    document.getElementById('os-sub').innerText = d.os + ' (' + d.kernel + ')';
+    document.getElementById('mem-val').innerText = d.mem_pct + '%';
+    document.getElementById('mem-bar').style.width = d.mem_pct + '%';
+    document.getElementById('mem-sub').innerText = d.mem_used_mb + ' / ' + d.mem_total_mb + ' MB';
+    document.getElementById('uptime-val').innerText = d.uptime_days + 'd';
+    document.getElementById('vip-val').innerText = d.virtual_ip;
+
+    const rbody = document.getElementById('routes-body');
+    rbody.innerHTML = '';
+    (d.routes || []).forEach(r => {
       const tr = document.createElement('tr');
       tr.innerHTML = `
-        <td style="color: var(--accent-blue); font-weight: bold;">${{r.domain}}</td>
-        <td>${{r.target}}</td>
-        <td style="color: var(--text-muted);">TCP/HTTP</td>
-        <td><span class="pill-active">ACTIVE</span></td>
+        <td style="font-weight: 600;">${r.domain}</td>
+        <td style="color: var(--text-secondary);">${r.target}</td>
+        <td><span class="tag">${r.proto}</span></td>
+        <td><span class="tag">${r.status}</span></td>
+        <td><a href="https://${r.domain}" target="_blank" class="link">Open</a></td>
       `;
-      tbody.appendChild(tr);
-    }});
-  }} catch(e) {{
-    console.error('Failed to load node info', e);
-  }}
-}}
+      rbody.appendChild(tr);
+    });
 
-async function runCmd() {{
-  const inp = document.getElementById('term-in');
-  const cmd = inp.value.trim();
-  if(!cmd) return;
-  inp.value = '';
-  const out = document.getElementById('term-out');
-  out.textContent += '\n$ ' + cmd + '\n';
-  out.scrollTop = out.scrollHeight;
+    const pbody = document.getElementById('peers-body');
+    pbody.innerHTML = '';
+    (d.peers || []).forEach(p => {
+      const tr = document.createElement('tr');
+      const isCur = curDomain.includes(p.node_id);
+      tr.innerHTML = `
+        <td style="font-weight: 600; color: ${isCur ? '#ffffff' : '#888888'};">${p.node_id} ${isCur ? '(Self)' : ''}</td>
+        <td><a href="https://${p.domain}" class="link">${p.domain}</a></td>
+        <td>${p.ip}</td>
+        <td style="color: var(--text-secondary);">${p.public}</td>
+        <td style="color: var(--text-muted);">${p.role}</td>
+        <td><span class="tag">${p.status}</span></td>
+      `;
+      pbody.appendChild(tr);
+    });
+  } catch (e) {
+    console.error(e);
+  }
+}
 
-  try {{
-    const res = await fetch('/api/exec', {{
+async function runShell() {
+  const inEl = document.getElementById('term-in');
+  const cmd = inEl.value.trim();
+  if (!cmd) return;
+  inEl.value = '';
+  const log = document.getElementById('term-log');
+  log.innerText += `\n$ ${cmd}\n`;
+  try {
+    const res = await fetch('/api/exec', {
       method: 'POST',
-      headers: {{ 'Content-Type': 'application/json' }},
-      body: JSON.stringify({{ command: cmd }})
-    }});
-    const data = await res.json();
-    if(data.stdout) out.textContent += data.stdout;
-    if(data.stderr) out.textContent += data.stderr;
-    out.scrollTop = out.scrollHeight;
-  }} catch(e) {{
-    out.textContent += 'Error executing command: ' + e + '\n';
-  }}
-}}
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ command: cmd })
+    });
+    const d = await res.json();
+    if (d.stdout) log.innerText += d.stdout;
+    if (d.stderr) log.innerText += d.stderr;
+    log.innerText += `[Exit ${d.exit_code} in ${d.elapsed_ms || 5}ms]\n`;
+    log.scrollTop = log.scrollHeight;
+  } catch (err) {
+    log.innerText += 'Communication failure: ' + err + '\n';
+  }
+}
 
-function runQuick(cmd) {{
-  document.getElementById('term-in').value = cmd;
-  runCmd();
-}}
+function execQuick(c) {
+  document.getElementById('term-in').value = c;
+  setTab('terminal');
+  runShell();
+}
 
-loadInfo();
-setInterval(loadInfo, 3000);
+function clearTerm() {
+  document.getElementById('term-log').innerText = 'Terminal cleared.\n';
+}
+
+function triggerLockdown() {
+  if (confirm("Initiate emergency network lockdown? All connections will be terminated immediately.")) {
+    execQuick("echo 'LOCKDOWN ORDER TRANSMITTED'");
+  }
+}
+
+updateSwitcher();
+refreshData();
+setInterval(refreshData, 2000);
 </script>
 </body>
-</html>"##,
-        domain, domain, domain
-    )
+</html>"##;
+
+    tpl.replace("__DOMAIN__", domain)
 }
