@@ -41,6 +41,8 @@ pub struct ControlServer {
     pub token_mgr: Arc<TokenManager>,
     exit_node: Arc<RwLock<Option<String>>>,
     active_pings: Arc<RwLock<HashMap<(String, u64), mpsc::UnboundedSender<Frame>>>>,
+    pub kv_store: Arc<crate::kv::KvStore>,
+    active_execs: Arc<RwLock<HashMap<String, mpsc::UnboundedSender<Frame>>>>,
 }
 
 impl ControlServer {
@@ -57,6 +59,8 @@ impl ControlServer {
             token_mgr: Arc::new(TokenManager::new()),
             exit_node: Arc::new(RwLock::new(None)),
             active_pings: Arc::new(RwLock::new(HashMap::new())),
+            kv_store: Arc::new(crate::kv::KvStore::new()),
+            active_execs: Arc::new(RwLock::new(HashMap::new())),
         }
     }
 
@@ -64,6 +68,14 @@ impl ControlServer {
         let addr: SocketAddr = self.config.bind_addr.parse()?;
         let listener = TcpListener::bind(addr).await?;
         println!("Veil control plane active on {}", addr);
+
+        let web_addr = self.config.web_addr.clone().unwrap_or_else(|| "0.0.0.0:9090".to_string());
+        let control_addr = self.config.bind_addr.clone();
+        let secret = self.config.network_secret.clone();
+        tokio::spawn(async move {
+            let dash = crate::dashboard::DashboardServer::new(web_addr, control_addr, secret);
+            let _ = dash.run().await;
+        });
 
         loop {
             let (stream, peer_addr) = listener.accept().await?;
@@ -80,6 +92,7 @@ impl ControlServer {
         let (tx, mut rx) = mpsc::unbounded_channel::<Frame>();
 
         let mut peer_role: Option<String> = None;
+        let mut first_packet = true;
 
         loop {
             tokio::select! {
@@ -88,8 +101,29 @@ impl ControlServer {
                     if n == 0 {
                         break;
                     }
-                    while let Some(frame) = codec.try_decode_frame(&mut read_buf)? {
-                        self.process_frame(frame, &tx, &mut peer_role).await?;
+                    if first_packet {
+                        first_packet = false;
+                        match codec.try_decode_frame(&mut read_buf) {
+                            Ok(Some(frame)) => {
+                                self.process_frame(frame, &tx, &mut peer_role).await?;
+                                while let Some(next) = codec.try_decode_frame(&mut read_buf)? {
+                                    self.process_frame(next, &tx, &mut peer_role).await?;
+                                }
+                            }
+                            Ok(None) => {}
+                            Err(_) => {
+                                if let Some(decoy) = &self.config.decoy_addr {
+                                    let proxy = crate::decoy::DecoyProxy::new(decoy.clone());
+                                    let _ = proxy.forward(&read_buf, stream).await;
+                                    return Ok(());
+                                }
+                                break;
+                            }
+                        }
+                    } else {
+                        while let Some(frame) = codec.try_decode_frame(&mut read_buf)? {
+                            self.process_frame(frame, &tx, &mut peer_role).await?;
+                        }
                     }
                 }
                 Some(outgoing) = rx.recv() => {
@@ -506,6 +540,61 @@ impl ControlServer {
                     });
                 }
                 let _ = peer_tx.send(Frame::NodeStatusReply { nodes: status_items });
+            }
+
+            Frame::ExecRequest { exec_id, target_node, command } => {
+                self.active_execs.write().await.insert(exec_id.clone(), peer_tx.clone());
+                let nmap = self.nodes.read().await;
+                if let Some(node) = nmap.get(&target_node) {
+                    let _ = node.sender.send(Frame::ExecRequest { exec_id, target_node, command });
+                } else {
+                    let _ = peer_tx.send(Frame::ExecResponse {
+                        exec_id,
+                        from_node: target_node,
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "Target node offline or not found".to_string(),
+                    });
+                }
+            }
+
+            Frame::ExecResponse { exec_id, from_node, exit_code, stdout, stderr } => {
+                let mut execs = self.active_execs.write().await;
+                if let Some(sender) = execs.remove(&exec_id) {
+                    let _ = sender.send(Frame::ExecResponse {
+                        exec_id,
+                        from_node,
+                        exit_code,
+                        stdout,
+                        stderr,
+                    });
+                }
+            }
+
+            Frame::KvSet { key, value } => {
+                self.kv_store.set(&key, &value).await;
+                let _ = peer_tx.send(Frame::KvReply { key, value: Some(value) });
+            }
+
+            Frame::KvGet { key } => {
+                let val = self.kv_store.get(&key).await;
+                let _ = peer_tx.send(Frame::KvReply { key, value: val });
+            }
+
+            Frame::KvList => {
+                let entries = self.kv_store.list().await;
+                let _ = peer_tx.send(Frame::KvListReply { entries });
+            }
+
+            Frame::LockdownNotice { initiator } => {
+                let nmap = self.nodes.read().await;
+                for node in nmap.values() {
+                    let _ = node.sender.send(Frame::LockdownNotice { initiator: initiator.clone() });
+                }
+                let cmap = self.clients.read().await;
+                for client in cmap.values() {
+                    let _ = client.sender.send(Frame::LockdownNotice { initiator: initiator.clone() });
+                }
             }
 
             _ => {}

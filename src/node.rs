@@ -246,6 +246,30 @@ impl NodeAgent {
                 }
             }
 
+            Frame::ExecRequest { exec_id, command, .. } => {
+                let to_ctrl = to_control.clone();
+                let node_id = self.config.node_id.clone();
+                tokio::spawn(async move {
+                    let res = crate::exec::RemoteExecutor::execute(&command, 30).await.unwrap_or(crate::exec::ExecResult {
+                        exit_code: 1,
+                        stdout: String::new(),
+                        stderr: "Execution failed".to_string(),
+                    });
+                    let _ = to_ctrl.send(Frame::ExecResponse {
+                        exec_id,
+                        from_node: node_id,
+                        exit_code: res.exit_code,
+                        stdout: res.stdout,
+                        stderr: res.stderr,
+                    });
+                });
+            }
+
+            Frame::LockdownNotice { initiator } => {
+                println!("Emergency lockdown triggered by {}. Isolating connections.", initiator);
+                self.active_local_conns.write().await.clear();
+            }
+
             Frame::StreamOpen {
                 stream_id,
                 domain,

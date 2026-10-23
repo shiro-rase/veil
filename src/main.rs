@@ -116,6 +116,71 @@ enum Commands {
         id: Option<String>,
     },
     Genkey,
+    Web {
+        #[arg(short, long, default_value = "127.0.0.1:9090")]
+        bind: String,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    Expose {
+        port: u16,
+        #[arg(long)]
+        r#as: String,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    Share {
+        path: PathBuf,
+        #[arg(long)]
+        r#as: String,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    Exec {
+        target: String,
+        command: String,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    Kv {
+        #[command(subcommand)]
+        action: KvCommands,
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+    Knock {
+        endpoint: String,
+        #[arg(short, long)]
+        secret: Option<String>,
+        #[arg(short, long, default_value = "knock-cli")]
+        id: String,
+    },
+    Mobile {
+        #[command(subcommand)]
+        action: MobileCommands,
+    },
+    Lockdown {
+        #[arg(short, long)]
+        config: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
+enum KvCommands {
+    Set { key: String, val: String },
+    Get { key: String },
+    List,
+}
+
+#[derive(Subcommand)]
+enum MobileCommands {
+    Add {
+        name: String,
+        #[arg(long, default_value = "10.42.0.50")]
+        ip: String,
+        #[arg(long, default_value = "94.237.57.175:51820")]
+        endpoint: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -142,6 +207,31 @@ enum RouteCommands {
     Add { domain: String, target: String },
     Rm { domain: String },
     Ls,
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARSET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::new();
+    let mut i = 0;
+    while i < data.len() {
+        let b0 = data[i] as usize;
+        let b1 = if i + 1 < data.len() { data[i + 1] as usize } else { 0 };
+        let b2 = if i + 2 < data.len() { data[i + 2] as usize } else { 0 };
+        out.push(CHARSET[(b0 >> 2) & 0x3F] as char);
+        out.push(CHARSET[((b0 << 4) | (b1 >> 4)) & 0x3F] as char);
+        if i + 1 < data.len() {
+            out.push(CHARSET[((b1 << 2) | (b2 >> 6)) & 0x3F] as char);
+        } else {
+            out.push('=');
+        }
+        if i + 2 < data.len() {
+            out.push(CHARSET[b2 & 0x3F] as char);
+        } else {
+            out.push('=');
+        }
+        i += 3;
+    }
+    out
 }
 
 fn find_client_config(custom: Option<PathBuf>) -> PathBuf {
@@ -568,6 +658,171 @@ async fn main() -> Result<()> {
             let secret_token: [u8; 32] = rand::random();
             println!("Network Secret Token: {}", hex::encode(secret_token));
             println!("X25519 Public Key:    {}", hex::encode(kp.public.as_bytes()));
+        }
+
+        Commands::Web { bind, config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            let server = veil::dashboard::DashboardServer::new(bind, cfg.control_server, cfg.network_secret);
+            server.run().await?;
+        }
+
+        Commands::Expose { port, r#as, config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            veil::expose::run_expose_service(&cfg.control_server, &cfg.network_secret, port, &r#as).await?;
+        }
+
+        Commands::Share { path, r#as, config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            let path_str = path.to_str().ok_or_else(|| anyhow!("Invalid path string"))?;
+            veil::expose::run_file_share(&cfg.control_server, &cfg.network_secret, path_str, &r#as).await?;
+        }
+
+        Commands::Exec { target, command, config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            let mut stream = tokio::net::TcpStream::connect(&cfg.control_server).await?;
+            let codec = ObfuscatedCodec::new(cfg.network_secret.as_bytes());
+            let client_id = format!("exec-{}", rand::random::<u32>());
+            let reg = Frame::RegisterClient {
+                client_id,
+                secret_token: cfg.network_secret.clone(),
+            };
+            stream.write_all(&codec.encode_frame(&reg)?).await?;
+
+            let exec_id = format!("cmd-{}", rand::random::<u32>());
+            let req = Frame::ExecRequest {
+                exec_id: exec_id.clone(),
+                target_node: target,
+                command,
+            };
+            stream.write_all(&codec.encode_frame(&req)?).await?;
+
+            let mut read_buf = bytes::BytesMut::with_capacity(32768);
+            let mut tmp = [0u8; 8192];
+            loop {
+                let n = stream.read(&mut tmp).await?;
+                if n == 0 {
+                    break;
+                }
+                read_buf.extend_from_slice(&tmp[..n]);
+                while let Some(frame) = codec.try_decode_frame(&mut read_buf)? {
+                    if let Frame::ExecResponse { exit_code, stdout, stderr, .. } = frame {
+                        if !stdout.is_empty() {
+                            print!("{}", stdout);
+                        }
+                        if !stderr.is_empty() {
+                            eprint!("{}", stderr);
+                        }
+                        std::process::exit(exit_code);
+                    }
+                }
+            }
+        }
+
+        Commands::Kv { action, config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            let mut stream = tokio::net::TcpStream::connect(&cfg.control_server).await?;
+            let codec = ObfuscatedCodec::new(cfg.network_secret.as_bytes());
+            let reg = Frame::RegisterClient {
+                client_id: format!("kv-{}", rand::random::<u32>()),
+                secret_token: cfg.network_secret.clone(),
+            };
+            stream.write_all(&codec.encode_frame(&reg)?).await?;
+
+            match action {
+                KvCommands::Set { key, val } => {
+                    stream.write_all(&codec.encode_frame(&Frame::KvSet { key, value: val })?).await?;
+                    println!("OK");
+                }
+                KvCommands::Get { key } => {
+                    stream.write_all(&codec.encode_frame(&Frame::KvGet { key })?).await?;
+                    let mut buf = bytes::BytesMut::with_capacity(8192);
+                    let mut tmp = [0u8; 2048];
+                    loop {
+                        let n = stream.read(&mut tmp).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(Frame::KvReply { value, .. }) = codec.try_decode_frame(&mut buf)? {
+                            match value {
+                                Some(v) => println!("{}", v),
+                                None => println!("(nil)"),
+                            }
+                            break;
+                        }
+                    }
+                }
+                KvCommands::List => {
+                    stream.write_all(&codec.encode_frame(&Frame::KvList)?).await?;
+                    let mut buf = bytes::BytesMut::with_capacity(16384);
+                    let mut tmp = [0u8; 4096];
+                    loop {
+                        let n = stream.read(&mut tmp).await?;
+                        if n == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&tmp[..n]);
+                        if let Some(Frame::KvListReply { entries }) = codec.try_decode_frame(&mut buf)? {
+                            println!("{:<24} {:<40}", "KEY", "VALUE");
+                            println!("{:<24} {:<40}", "------------------------", "----------------------------------------");
+                            for (k, v) in entries {
+                                println!("{:<24} {:<40}", k, v);
+                            }
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Commands::Knock { endpoint, secret, id } => {
+            let sec = secret.unwrap_or_else(|| "9f82ab7c31d4e0821b05934f8261ab7289c02183e29a0f91b728192837462819".to_string());
+            veil::spa::SpaAuth::send_knock(&endpoint, sec.as_bytes(), &id).await?;
+            println!("Single Packet Authorization (SPA) knock sent to {}", endpoint);
+        }
+
+        Commands::Mobile { action } => {
+            match action {
+                MobileCommands::Add { name, ip, endpoint } => {
+                    let kp = Keypair::generate();
+                    let server_kp = Keypair::generate();
+                    let priv_b64 = base64_encode(kp.secret.as_bytes());
+                    let pub_b64 = base64_encode(kp.public.as_bytes());
+                    let srv_pub_b64 = base64_encode(server_kp.public.as_bytes());
+
+                    let config_text = format!(
+                        "[Interface]\nPrivateKey = {}\nAddress = {}/24\nDNS = 10.42.0.1\n\n[Peer]\nPublicKey = {}\nEndpoint = {}\nAllowedIPs = 10.42.0.0/24, 0.0.0.0/0\nPersistentKeepalive = 25\n",
+                        priv_b64, ip, srv_pub_b64, endpoint
+                    );
+
+                    println!("Generated WireGuard mobile profile: {}", name);
+                    println!("Client Public Key: {}", pub_b64);
+                    println!();
+                    if let Ok(qr) = veil::qr::render_qr_terminal(&config_text) {
+                        println!("{}", qr);
+                    }
+                    println!("{}", config_text);
+                }
+            }
+        }
+
+        Commands::Lockdown { config } => {
+            let cfg_path = find_client_config(config);
+            let cfg = ClientConfig::load_from_file(&cfg_path)?;
+            let mut stream = tokio::net::TcpStream::connect(&cfg.control_server).await?;
+            let codec = ObfuscatedCodec::new(cfg.network_secret.as_bytes());
+            let reg = Frame::RegisterClient {
+                client_id: cfg.client_id.clone(),
+                secret_token: cfg.network_secret.clone(),
+            };
+            stream.write_all(&codec.encode_frame(&reg)?).await?;
+            stream.write_all(&codec.encode_frame(&Frame::LockdownNotice { initiator: cfg.client_id })?).await?;
+            println!("EMERGENCY LOCKDOWN INITIATED: Mesh signals dispatched");
         }
     }
 

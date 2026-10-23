@@ -246,3 +246,73 @@ fn test_file_transfer_and_status_codec() {
         panic!("Wrong frame");
     }
 }
+
+#[tokio::test]
+async fn test_spa_auth_knock_and_verification() {
+    let secret = b"my-mesh-spa-secret-999";
+    let client_id = "node-alpha";
+    let packet = veil::spa::SpaAuth::create_knock_packet(secret, client_id);
+    assert_eq!(packet.len(), 64);
+
+    let valid = veil::spa::SpaAuth::verify_knock_packet(secret, &packet, 30).unwrap();
+    assert!(valid);
+
+    let wrong_secret = b"wrong-secret-token-111";
+    let invalid = veil::spa::SpaAuth::verify_knock_packet(wrong_secret, &packet, 30).unwrap();
+    assert!(!invalid);
+
+    let mut corrupted = packet;
+    corrupted[10] ^= 0xFF;
+    let corrupted_valid = veil::spa::SpaAuth::verify_knock_packet(secret, &corrupted, 30).unwrap();
+    assert!(!corrupted_valid);
+}
+
+#[tokio::test]
+async fn test_kv_store_operations() {
+    let kv = veil::kv::KvStore::new();
+    kv.set("cluster/region", "eu-central").await;
+    kv.set("cluster/replicas", "3").await;
+
+    let region = kv.get("cluster/region").await;
+    assert_eq!(region, Some("eu-central".to_string()));
+
+    let list = kv.list().await;
+    assert_eq!(list.len(), 2);
+    assert_eq!(list.get("cluster/replicas"), Some(&"3".to_string()));
+
+    let deleted = kv.delete("cluster/replicas").await;
+    assert!(deleted);
+    assert_eq!(kv.get("cluster/replicas").await, None);
+}
+
+#[tokio::test]
+async fn test_remote_executor_sh() {
+    let res = veil::exec::RemoteExecutor::execute("echo 'veil-exec-test'", 5).await.unwrap();
+    assert_eq!(res.exit_code, 0);
+    assert!(res.stdout.contains("veil-exec-test"));
+}
+
+#[tokio::test]
+async fn test_udp_data_plane_encryption() {
+    let secret = b"mesh-udp-secret-key-100";
+    let plane1 = veil::udp_data::UdpDataPlane::bind("127.0.0.1:0", secret).await.unwrap();
+    let plane2 = veil::udp_data::UdpDataPlane::bind("127.0.0.1:0", secret).await.unwrap();
+
+    let addr2 = plane2.local_addr().unwrap();
+    plane1.add_peer("10.42.0.2".to_string(), addr2).await;
+
+    let payload = b"IP_RAW_PACKET_TEST_PAYLOAD";
+    let sent = plane1.send_ip_packet("10.42.0.2", payload).await.unwrap();
+    assert!(sent);
+
+    let (decrypted, from) = plane2.recv_ip_packet().await.unwrap();
+    assert_eq!(decrypted, payload);
+    assert_eq!(from, plane1.local_addr().unwrap());
+}
+
+#[test]
+fn test_qr_terminal_rendering() {
+    let content = "[Interface]\nPrivateKey = secret\nAddress = 10.42.0.50/24\n";
+    let qr = veil::qr::render_qr_terminal(content).unwrap();
+    assert!(!qr.is_empty());
+}

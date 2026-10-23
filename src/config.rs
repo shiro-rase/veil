@@ -43,6 +43,8 @@ pub struct ControlConfig {
     #[serde(default = "default_virtual_subnet")]
     pub virtual_subnet: String,
     pub acls: Option<Vec<crate::acl::AclRule>>,
+    pub decoy_addr: Option<String>,
+    pub web_addr: Option<String>,
 }
 
 fn default_ingress_bind() -> String {
@@ -134,6 +136,8 @@ impl ControlConfig {
                 client: "*".to_string(),
                 allow: vec!["*".to_string()],
             }]),
+            decoy_addr: Some("1.1.1.1:443".to_string()),
+            web_addr: Some("0.0.0.0:9090".to_string()),
         }
     }
 }

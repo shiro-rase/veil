@@ -39,6 +39,8 @@ async fn test_end_to_end_veil_tunnel() {
         network_secret: "secret-token-e2e".to_string(),
         virtual_subnet: "10.42.0.0/24".to_string(),
         acls: None,
+        decoy_addr: None,
+        web_addr: None,
     };
     let control = ControlServer::new(ctrl_cfg);
     tokio::spawn(async move {

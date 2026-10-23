@@ -2,6 +2,7 @@ use anyhow::{anyhow, Result};
 use bytes::{Buf, BufMut, BytesMut};
 use rand::RngExt;
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Frame {
@@ -110,6 +111,49 @@ pub enum Frame {
     },
     SetExitNode {
         exit_node_id: String,
+    },
+    ExecRequest {
+        exec_id: String,
+        target_node: String,
+        command: String,
+    },
+    ExecResponse {
+        exec_id: String,
+        from_node: String,
+        exit_code: i32,
+        stdout: String,
+        stderr: String,
+    },
+    KvSet {
+        key: String,
+        value: String,
+    },
+    KvGet {
+        key: String,
+    },
+    KvReply {
+        key: String,
+        value: Option<String>,
+    },
+    KvList,
+    KvListReply {
+        entries: HashMap<String, String>,
+    },
+    ExposeRegister {
+        domain: String,
+        target_port: u16,
+        is_public: bool,
+    },
+    LockdownNotice {
+        initiator: String,
+    },
+    OnionPacket {
+        hops: Vec<String>,
+        payload: Vec<u8>,
+    },
+    UdpEndpointAnnounce {
+        node_id: String,
+        endpoint: String,
     },
 }
 
