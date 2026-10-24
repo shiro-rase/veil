@@ -48,6 +48,8 @@ enum Commands {
         args: Vec<String>,
     },
     Cp {
+        #[arg(short, long)]
+        recursive: bool,
         src: String,
         dst: String,
         #[arg(short, long)]
@@ -375,7 +377,12 @@ async fn main() -> Result<()> {
             }
         }
 
-        Commands::Cp { src, dst, config } => {
+        Commands::Cp {
+            recursive,
+            src,
+            dst,
+            config,
+        } => {
             let cfg_path = find_client_config(config);
             let cfg = ClientConfig::load_from_file(&cfg_path)?;
 
@@ -387,9 +394,28 @@ async fn main() -> Result<()> {
                 return Err(anyhow!("Destination must be in format <node>:<remote_path>"));
             };
 
-            let metadata = fs::metadata(&local_path)?;
+            let is_directory = local_path.is_dir() || recursive;
+            if is_directory && !local_path.is_dir() {
+                return Err(anyhow!("Source path is not a directory: {}", local_path.display()));
+            }
+
+            let (upload_path, is_temp, upload_target_path) = if is_directory {
+                let temp_tar = std::env::temp_dir().join(format!("veil_dir_{}.tar.gz", hex::encode(rand::random::<[u8; 4]>())));
+                let status = std::process::Command::new("tar")
+                    .args(["-czf", temp_tar.to_str().unwrap(), "-C", local_path.to_str().unwrap(), "."])
+                    .status()?;
+                if !status.success() {
+                    return Err(anyhow!("Failed to archive directory for transfer"));
+                }
+                let remote_tar = format!("/tmp/.veil_pkg_{}.tar.gz", hex::encode(rand::random::<[u8; 4]>()));
+                (temp_tar, true, remote_tar)
+            } else {
+                (local_path.clone(), false, remote_path.clone())
+            };
+
+            let metadata = fs::metadata(&upload_path)?;
             let total_size = metadata.len();
-            let filename = local_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+            let filename = upload_path.file_name().unwrap_or_default().to_string_lossy().to_string();
 
             let stream = tokio::net::TcpStream::connect(&cfg.control_server).await?;
             let codec = ObfuscatedCodec::new(cfg.network_secret.as_bytes());
@@ -405,11 +431,11 @@ async fn main() -> Result<()> {
                 transfer_id: transfer_id.clone(),
                 target_node: target_node.clone(),
                 filename: filename.clone(),
-                target_path: remote_path.clone(),
+                target_path: upload_target_path.clone(),
                 total_size,
             })?).await?;
 
-            let mut file = std::fs::File::open(&local_path)?;
+            let mut file = std::fs::File::open(&upload_path)?;
             use std::io::Read;
             let mut chunk_buf = vec![0u8; 65536];
             let mut sent_bytes = 0u64;
@@ -424,7 +450,11 @@ async fn main() -> Result<()> {
                     data: chunk_buf[..n].to_vec(),
                 })?).await?;
                 sent_bytes += n as u64;
-                let pct = (sent_bytes as f64 / total_size as f64 * 100.0) as u32;
+                let pct = if total_size > 0 {
+                    (sent_bytes as f64 / total_size as f64 * 100.0) as u32
+                } else {
+                    100
+                };
                 print!("\rSending {} to {}: {} / {} bytes ({}%)", filename, target_node, sent_bytes, total_size, pct);
                 use std::io::Write;
                 std::io::stdout().flush().unwrap();
@@ -433,14 +463,35 @@ async fn main() -> Result<()> {
 
             writer.write_all(&codec.encode_frame(&Frame::FileTransferDone {
                 transfer_id,
-                target_node,
+                target_node: target_node.clone(),
                 success: true,
                 message: "Done".to_string(),
             })?).await?;
 
             let mut temp = [0u8; 1024];
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), reader.read(&mut temp)).await;
-            println!("File transfer completed successfully.");
+
+            if is_temp {
+                let extract_cmd = format!(
+                    "mkdir -p '{}' && tar -xzf '{}' -C '{}' && rm -f '{}'",
+                    remote_path,
+                    upload_target_path,
+                    remote_path,
+                    upload_target_path
+                );
+                let exec_id = format!("cmd-{}", rand::random::<u32>());
+                let req = Frame::ExecRequest {
+                    exec_id,
+                    target_node: target_node.clone(),
+                    command: extract_cmd,
+                };
+                writer.write_all(&codec.encode_frame(&req)?).await?;
+                let _ = tokio::time::timeout(tokio::time::Duration::from_secs(3), reader.read(&mut temp)).await;
+                let _ = std::fs::remove_file(&upload_path);
+                println!("Directory {} unpacked to {} on {}", local_path.display(), remote_path, target_node);
+            } else {
+                println!("File transfer completed successfully.");
+            }
         }
 
         Commands::Tui { config } => {
